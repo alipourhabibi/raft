@@ -8,6 +8,7 @@ import (
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
 	"github.com/alipourhabibi/raft/internal/raft"
+	"github.com/alipourhabibi/raft/internal/repository/raft/memory"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
@@ -23,7 +24,8 @@ func NewGrpcServer(config *config.Config) *GrpcServer {
 }
 
 func (g *GrpcServer) Boot() error {
-	r := raft.NewRaftService()
+	memoryRepo := memory.NewMemoryDB()
+	r := raft.NewRaftService(memoryRepo)
 	grpcServer := grpc.NewServer()
 	raftpb.RegisterRaftServiceServer(grpcServer, r)
 	reflection.Register(grpcServer)
