@@ -9,6 +9,12 @@ import (
 
 type Config struct {
 	Port int `env:"PORT"`
+
+	ElectionTimeoutStart uint64 `env:"ELECTION_TIMEOUT_START"`
+	ElectionTimeoutEnd   uint64 `env:"ELECTION_TIMEOUT_END"`
+
+	ID    string            `env:"ID"`
+	Nodes map[string]string `env:"NODES"` // nodeID: url
 }
 
 func NewConfig() (*Config, error) {

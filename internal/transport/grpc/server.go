@@ -8,26 +8,28 @@ import (
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
 	"github.com/alipourhabibi/raft/internal/raft"
-	"github.com/alipourhabibi/raft/internal/repository/raft/memory"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
 
 type GrpcServer struct {
-	port int
+	port        int
+	raftService *raft.Raft
 }
 
-func NewGrpcServer(config *config.Config) *GrpcServer {
+func NewGrpcServer(
+	config *config.Config,
+	raftService *raft.Raft,
+) *GrpcServer {
 	return &GrpcServer{
-		port: config.Port,
+		port:        config.Port,
+		raftService: raftService,
 	}
 }
 
 func (g *GrpcServer) Boot() error {
-	memoryRepo := memory.NewMemoryDB()
-	r := raft.NewRaftService(memoryRepo)
 	grpcServer := grpc.NewServer()
-	raftpb.RegisterRaftServiceServer(grpcServer, r)
+	raftpb.RegisterRaftServiceServer(grpcServer, g.raftService)
 	reflection.Register(grpcServer)
 
 	slog.Info("Starting grpc server", "port", g.port)
