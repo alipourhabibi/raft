@@ -181,7 +181,7 @@ func (r *Raft) startElection() error {
 	// 3. Reset election timer
 	r.lastElectionTimeout = uint64(time.Now().Unix())
 
-	lastLogIndex, err := r.repository.GetCommitIndex(ctx)
+	lastLogIndex, err := r.repository.GetLastAppliedIndex(ctx)
 	if err != nil {
 		return err
 	}
@@ -255,7 +255,7 @@ func (r *Raft) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) 
 		return nil, err
 	}
 	// Already voted in this term and candidate is not the same as voted before
-	if votedFor != nil && votedFor != &req.CandidateId {
+	if votedFor != nil && *votedFor != req.CandidateId {
 		return &raftpb.RequestVoteResponse{
 			Term:    currentTerm,
 			Granted: false,
