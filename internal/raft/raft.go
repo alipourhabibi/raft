@@ -3,10 +3,11 @@ package raft
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand/v2"
-	"net"
+	"sync"
 	"time"
 
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
@@ -19,13 +20,13 @@ import (
 type Raft struct {
 	raftpb.UnimplementedRaftServiceServer
 
-	repository          repository.RaftRepository
-	role                raftpb.Role
-	lastElectionTimeout uint64
-	config              *config.Config
-	clients             map[string]raftpb.RaftServiceClient
+	mu         sync.RWMutex
+	repository repository.RaftRepository
+	role       raftpb.Role
+	config     *config.Config
+	clients    map[string]raftpb.RaftServiceClient
 
-	heartbeatCh chan []*raftpb.Entry
+	heartbeatCh chan struct{}
 }
 
 func NewRaftService(
@@ -38,10 +39,6 @@ func NewRaftService(
 		conn, err := grpc.NewClient(
 			v,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 10 * time.Second}
-				return d.DialContext(ctx, "tcp", s)
-			}),
 		)
 		if err != nil {
 			return nil, err
@@ -52,9 +49,21 @@ func NewRaftService(
 		config:      config,
 		repository:  repository,
 		role:        raftpb.Role_FOLLOWER,
-		heartbeatCh: make(chan []*raftpb.Entry, 10_000), // NOTE is size ok?
+		heartbeatCh: make(chan struct{}),
 		clients:     clients,
 	}, nil
+}
+
+func (r *Raft) changeRole(role raftpb.Role) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.role = role
+}
+
+func (r *Raft) getRole() raftpb.Role {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.role
 }
 
 // This method is the logic loop and runs infinitely
@@ -62,28 +71,34 @@ func (r *Raft) Serve() error {
 	for {
 
 		slog.Debug("Starting new round", "role", r.role)
+		ctx := context.Background()
 
-		switch r.role {
+		role := r.getRole()
+		switch role {
 		case raftpb.Role_FOLLOWER, raftpb.Role_CANDIDATE:
 
 			timeoutMs := (rand.Uint64N(r.config.ElectionTimeoutEnd-r.config.ElectionTimeoutStart) + r.config.ElectionTimeoutStart) * uint64(time.Millisecond)
-			ticker := time.NewTicker(time.Duration(timeoutMs))
+			ticker := time.After(time.Duration(timeoutMs))
 
 			select {
-			case <-ticker.C:
+			case <-ticker:
 				slog.Debug("ticker ticked", "role", r.role, "timeoutMs", timeoutMs)
-				r.role = raftpb.Role_CANDIDATE
+				r.changeRole(raftpb.Role_CANDIDATE)
 				err := r.startElection()
 				if err != nil {
 					slog.Error("failed to start election", "error", err)
 				} else {
-					r.role = raftpb.Role_LEADER
+					r.changeRole(raftpb.Role_LEADER)
+					if err := r.repository.InitLeaderState(ctx); err != nil {
+						slog.Error("failed to init leader state", "error", err)
+						r.role = raftpb.Role_FOLLOWER
+					}
 					slog.Debug("start election succeeded", "role", r.role)
 				}
-			case data := <-r.heartbeatCh:
-				slog.Debug("heartbeat received", "data", data, "role", r.role)
-				r.role = raftpb.Role_FOLLOWER
-				err := r.handleHeartbeat(data)
+			case <-r.heartbeatCh:
+				slog.Debug("heartbeat received", "role", r.role)
+				r.changeRole(raftpb.Role_FOLLOWER)
+				err := r.handleHeartbeat(ctx)
 				if err != nil {
 					slog.Error("failed to handle heartbeat", "error", err)
 				}
@@ -91,30 +106,60 @@ func (r *Raft) Serve() error {
 
 		case raftpb.Role_LEADER:
 
-			timeoutMs := (rand.Uint64N(r.config.ElectionTimeoutEnd-r.config.ElectionTimeoutStart) + r.config.ElectionTimeoutStart) * uint64(time.Millisecond) / 2 // TODO it should be another env
-			ticker := time.NewTicker(time.Duration(timeoutMs))
+			timeoutMs := r.config.HeartbeatTimeout * uint64(time.Millisecond)
+			ticker := time.After(time.Duration(timeoutMs))
 
 			select {
-			case <-ticker.C:
+			case <-ticker:
 				slog.Debug("ticker ticked", "role", r.role, "timeoutMs", timeoutMs)
 				err := r.sendHeartbeat()
 				if err != nil {
 					slog.Error("failed to send heartbeat", "error", err)
 				}
 			case <-r.heartbeatCh:
-				r.role = raftpb.Role_FOLLOWER
+				r.changeRole(raftpb.Role_FOLLOWER)
 				slog.Debug("heartbeat received as leader")
 			}
 		}
 	}
 }
 
-// TODO
-func (r *Raft) handleHeartbeat(data []*raftpb.Entry) error {
+func (r *Raft) handleHeartbeat(ctx context.Context) error {
+	commitIndex, err := r.repository.GetCommitIndex(ctx)
+	if err != nil {
+		return err
+	}
+
+	lastApplied, err := r.repository.GetLastAppliedIndex(ctx)
+	if err != nil {
+		return err
+	}
+
+	if lastApplied >= commitIndex {
+		return nil
+	}
+
+	for i := lastApplied + 1; i <= commitIndex; i++ {
+		entry, err := r.repository.GetEntryAtIndex(ctx, i)
+		if err != nil {
+			return fmt.Errorf("failed to get entry at index %d: %w", i, err)
+		}
+		if err = r.applyEntry(entry); err != nil {
+			return fmt.Errorf("failed to apply entry at index %d: %w", i, err)
+		}
+		if err = r.repository.SetLastApplied(ctx, i); err != nil {
+			return fmt.Errorf("failed to advance lastApplied to %d: %w", i, err)
+		}
+	}
 	return nil
 }
 
-// TODO
+func (r *Raft) applyEntry(entry *raftpb.Entry) error {
+	slog.Debug("applying entry", "term", entry.Term, "data", entry)
+	// TODO: forward to state machine
+	return nil
+}
+
 func (r *Raft) sendHeartbeat() error {
 	ctx := context.Background()
 
@@ -124,41 +169,82 @@ func (r *Raft) sendHeartbeat() error {
 	}
 
 	for id, v := range r.clients {
-		clientLogIndex, err := r.repository.GetMatchIndexByNodeID(ctx, id)
+
+		nextIdx, err := r.repository.GetNextIndexByNodeID(ctx, id)
 		if err != nil {
-			return err
+			slog.Error("failed to get nextIndex", "nodeID", id, "error", err)
+			continue
 		}
-		entries, err := r.repository.GetEntryFromIndex(ctx, clientLogIndex)
+		prevLogIndex := nextIdx - 1
+
+		prevEntry, err := r.repository.GetEntryAtIndex(ctx, prevLogIndex)
 		if err != nil {
-			return err
-		}
-		commitIndex, err := r.repository.GetCommitIndex(ctx)
-		if err != nil {
-			return err
+			slog.Error("failed to get prev entry", "error", err)
+			continue
 		}
 
-		lastLogTerm := uint64(0)
-		if len(entries) > 0 {
-			lastLogTerm = entries[len(entries)-1].Term
+		entries, err := r.repository.GetEntryFromIndex(ctx, prevLogIndex)
+		if err != nil {
+			continue
+		}
+
+		commitIndex, err := r.repository.GetCommitIndex(ctx)
+		if err != nil {
+			continue
 		}
 
 		resp, err := v.AppendEntries(ctx, &raftpb.AppendEntriesRequest{
 			Term:         term,
 			LeaderId:     r.config.ID,
-			PrevLogIndex: clientLogIndex,
+			PrevLogIndex: prevLogIndex,
 			Entries:      entries,
-			PrevLogTerm:  lastLogTerm,
+			PrevLogTerm:  prevEntry.Term,
 			LeaderCommit: commitIndex,
 		})
 		if err != nil {
 			slog.Error("failed to AppendEntries", "error", err)
-			return err
+			continue
 		}
-		slog.Debug("AppendEntries succeeded", "resp", resp, "clientID", id)
+
 		if !resp.Success {
-			//TODO repeat mechanism
+			if resp.Term > term {
+				// we are stale - step down immediately and stop the round
+				slog.Debug("discovered higher term in AppendEntries response, stepping down")
+				if err = r.repository.SetCurrentTerm(ctx, resp.Term); err != nil {
+					slog.Error("failed to update term", "error", err)
+				}
+				r.changeRole(raftpb.Role_FOLLOWER)
+				select {
+				case r.heartbeatCh <- struct{}{}:
+				default:
+				}
+				return nil
+			}
+
+			// log inconsistency - back off nextIndex and retry on the next heartbeat
+			if nextIdx > 1 {
+				if err = r.repository.SetNextIndex(ctx, id, nextIdx-1); err != nil {
+					slog.Error("failed to decrement nextIndex", "nodeID", id, "error", err)
+				}
+			}
+			slog.Debug("AppendEntries rejected, backed off nextIndex", "nodeID", id, "newNextIndex", nextIdx-1)
+			continue
 		}
-		// TODO resp.Term??
+
+		newMatchIndex := prevLogIndex + uint64(len(entries))
+		if err = r.repository.SetMatchIndex(ctx, id, newMatchIndex); err != nil {
+			slog.Error("failed to update matchIndex", "nodeID", id, "error", err)
+			continue // skip nextIndex update too, try again next heartbeat
+		}
+		if err = r.repository.SetNextIndex(ctx, id, newMatchIndex+1); err != nil {
+			slog.Error("failed to update nextIndex", "nodeID", id, "error", err)
+			continue
+		}
+		slog.Debug("AppendEntries succeeded", "nodeID", id, "matchIndex", newMatchIndex)
+	}
+
+	if err := r.tryAdvanceCommitIndex(ctx); err != nil {
+		slog.Error("failed to advance commit index", "error", err)
 	}
 	return nil
 }
@@ -179,53 +265,121 @@ func (r *Raft) startElection() error {
 	}
 
 	// 3. Reset election timer
-	r.lastElectionTimeout = uint64(time.Now().Unix())
+	select {
+	case r.heartbeatCh <- struct{}{}:
+	default:
+	}
 
-	lastLogIndex, err := r.repository.GetLastAppliedIndex(ctx)
+	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
 	if err != nil {
 		return err
 	}
 
-	entries, err := r.repository.GetEntryFromIndex(ctx, lastLogIndex)
+	lastLogEntry, err := r.repository.GetEntryAtIndex(ctx, lastLogIndex)
 	if err != nil {
 		return err
 	}
-	lastLogTerm := uint64(0)
-	if len(entries) > 0 {
-		lastLogTerm = entries[len(entries)-1].Term
-	}
 
-	// 4. Send RequestVote to all nodes
-	// NOTE: for now we do this; but it should return as soon as get the max votes
-	// We will make it parallel
-	// wg := &sync.WaitGroup{}
-	// wg.Add(len(r.clients))
-	// wg.Wait()
-	sucessRate := math.Ceil(float64(len(r.clients) / 2))
-	rate := 0
+	// sucessRate is the number of *other* nodes we need votes from.
+	// The leader already counts its own vote implicitly (via VoteFor above),
+	// so majority = ceil((total_nodes) / 2) = ceil((len(clients)+1) / 2).
+	// Because len(clients) = total-1, ceil(len(clients)/2) gives the same
+	// result for the remaining votes needed. Examples:
+	//   3-node cluster: clients=2 → ceil(2/2)=1 → need 1 of 2 others ✓
+	//   5-node cluster: clients=4 → ceil(4/2)=2 → need 2 of 4 others ✓
+	neededVotes := int(math.Ceil(float64(len(r.clients)) / 2))
+
+	type result struct {
+		granted bool
+		term    uint64
+	}
+	resultCh := make(chan result, len(r.clients))
+
 	for _, v := range r.clients {
-		ctx, cancel := context.WithTimeout(ctx, 1000*time.Millisecond)
-		defer cancel() // TODO
-		resp, err := v.RequestVote(ctx, &raftpb.RequestVoteRequest{
-			Term:         newTerm,
-			CandidateId:  r.config.ID,
-			LastLogIndex: lastLogIndex,
-			LastLogTerm:  lastLogTerm, // TODO
-		})
+		go func() {
+			ctx2, cancel := context.WithTimeout(ctx, 1000*time.Millisecond)
+			defer cancel()
+			resp, err := v.RequestVote(ctx2, &raftpb.RequestVoteRequest{
+				Term:         newTerm,
+				CandidateId:  r.config.ID,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogEntry.Term,
+			})
+			if err != nil {
+				slog.Error("failed to RequestVote", "error", err)
+				resultCh <- result{granted: false}
+				return
+			}
+			resultCh <- result{granted: resp.Granted, term: resp.Term}
+		}()
+	}
+
+	votes := 0
+	for range r.clients {
+		res := <-resultCh
+
+		// if any peer has a higher term, we are stale - abort immediately
+		if res.term > newTerm {
+			if err = r.repository.SetCurrentTerm(ctx, res.term); err != nil {
+				slog.Error("failed to update term after stale election", "error", err)
+			}
+			r.changeRole(raftpb.Role_FOLLOWER)
+			return errors.New("discovered higher term during election")
+		}
+
+		if res.granted {
+			votes++
+			if votes >= neededVotes {
+				return nil
+			}
+		}
+	}
+
+	return errors.New("election failed: not enough votes")
+}
+
+func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) error {
+	currentTerm, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return err
+	}
+	commitIndex, err := r.repository.GetCommitIndex(ctx)
+	if err != nil {
+		return err
+	}
+	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		return err
+	}
+
+	for n := lastLogIndex; n > commitIndex; n-- {
+		entry, err := r.repository.GetEntryAtIndex(ctx, n)
 		if err != nil {
-			slog.Error("failed to RequestVote", "error", err)
 			continue
 		}
-		slog.Debug("RequestVote succeeded", "resp", resp)
-		if resp.Granted {
-			rate++
+
+		// Only commit entries from the current term (Raft §5.4.2)
+		if entry.Term != currentTerm {
+			continue
+		}
+
+		// Count how many nodes have this entry
+		replicatedCount := 1 // leader always has it
+		for nodeID := range r.clients {
+			matchIdx, _ := r.repository.GetMatchIndexByNodeID(ctx, nodeID)
+			if matchIdx >= n {
+				replicatedCount++
+			}
+		}
+
+		// +1 because majority means more than half of ALL nodes (including leader)
+		majority := len(r.clients)/2 + 1
+		if replicatedCount >= majority {
+			// Found the highest safely committable index
+			return r.repository.SetCommitIndex(ctx, n)
 		}
 	}
-	if rate >= int(sucessRate) {
-		return nil
-	}
-	slog.Debug("finished election", "rate", rate, "neededRate", sucessRate)
-	return errors.New("election failed")
+	return nil
 }
 
 func (r *Raft) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
@@ -240,17 +394,16 @@ func (r *Raft) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) 
 			Term:    currentTerm,
 			Granted: false,
 		}, nil
-	} else {
-		r.role = raftpb.Role_FOLLOWER
-		r.heartbeatCh <- []*raftpb.Entry{} // TODO
+	}
+
+	if req.Term > currentTerm {
 		err = r.repository.SetCurrentTerm(ctx, req.Term)
-		// NOTE: should it return error or no?
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	votedFor, err := r.repository.GetVotedFor(ctx, currentTerm)
+	votedFor, err := r.repository.GetVotedFor(ctx, req.Term)
 	if err != nil {
 		return nil, err
 	}
@@ -262,21 +415,33 @@ func (r *Raft) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) 
 		}, nil
 	}
 
-	lastCommitIndex, err := r.repository.GetCommitIndex(ctx)
+	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
 	if err != nil {
 		return nil, err
 	}
+	lastLogEntry, err := r.repository.GetEntryAtIndex(ctx, lastLogIndex)
+	if err != nil {
+		return nil, err
+	}
+	lastLogTerm := lastLogEntry.Term
 
-	if lastCommitIndex > req.LastLogIndex {
-		return &raftpb.RequestVoteResponse{
-			Term:    currentTerm,
-			Granted: false,
-		}, nil
+	ourIsMoreUpToDate := lastLogTerm > req.LastLogTerm ||
+		(lastLogTerm == req.LastLogTerm && lastLogIndex > req.LastLogIndex)
+
+	if ourIsMoreUpToDate {
+		return &raftpb.RequestVoteResponse{Term: currentTerm, Granted: false}, nil
 	}
 
 	err = r.repository.VoteFor(ctx, req.Term, req.CandidateId)
 	if err != nil {
 		return nil, err
+	}
+
+	r.changeRole(raftpb.Role_FOLLOWER)
+	// reset the timer
+	select {
+	case r.heartbeatCh <- struct{}{}:
+	default:
 	}
 
 	return &raftpb.RequestVoteResponse{
@@ -291,6 +456,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReque
 	if err != nil {
 		return nil, err
 	}
+
 	if currentTerm > req.Term {
 		return &raftpb.AppendEntriesResponse{
 			Success: false,
@@ -298,30 +464,36 @@ func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReque
 		}, nil
 	}
 
-	entries, err := r.repository.GetEntryFromIndex(ctx, req.PrevLogIndex)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(entries) != 0 && entries[len(entries)-1].Term != req.PrevLogTerm {
-		return &raftpb.AppendEntriesResponse{
-			Success: false,
-			Term:    currentTerm,
-		}, nil
-	}
-
-	// TODO
-	//  If an existing entry conflicts with a new one (same index
-	// but different terms), delete the existing entry and all that
-	//follow it
-
-	// TODO
-	//  Append any new entries not already in the log
-	r.heartbeatCh <- req.Entries
-
 	if req.Term > currentTerm {
-		err = r.repository.SetCurrentTerm(ctx, req.Term)
-		if err != nil {
+		if err = r.repository.SetCurrentTerm(ctx, req.Term); err != nil {
+			return nil, err
+		}
+	}
+	r.changeRole(raftpb.Role_FOLLOWER)
+	select {
+	case r.heartbeatCh <- struct{}{}:
+	default:
+	}
+
+	prevEntry, err := r.repository.GetEntryAtIndex(ctx, req.PrevLogIndex)
+	if err != nil {
+		return &raftpb.AppendEntriesResponse{Success: false, Term: currentTerm}, nil
+	}
+	if prevEntry.Term != req.PrevLogTerm {
+		return &raftpb.AppendEntriesResponse{Success: false, Term: currentTerm}, nil
+	}
+
+	if len(req.Entries) > 0 {
+		if err = r.repository.AppendEntries(ctx, req.PrevLogIndex, req.Entries); err != nil {
+			return nil, err
+		}
+	}
+
+	// Advance follower commitIndex
+	if req.LeaderCommit > 0 {
+		lastNewIndex := req.PrevLogIndex + uint64(len(req.Entries))
+		commitUpTo := min(req.LeaderCommit, lastNewIndex)
+		if err = r.repository.SetCommitIndex(ctx, commitUpTo); err != nil {
 			return nil, err
 		}
 	}

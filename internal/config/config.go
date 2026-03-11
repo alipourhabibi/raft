@@ -15,6 +15,8 @@ type Config struct {
 
 	ID    string            `env:"ID"`
 	Nodes map[string]string `env:"NODES"` // nodeID: url
+
+	HeartbeatTimeout uint64 `env:"HEARTBEAT_TIMEOUT"`
 }
 
 func NewConfig() (*Config, error) {

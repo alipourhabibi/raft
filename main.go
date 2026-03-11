@@ -16,11 +16,8 @@ import (
 func main() {
 	opts := &slog.HandlerOptions{
 		Level: slog.LevelDebug,
-		// You can still override time format if you want something custom
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
-				// Optional: force particular format
-				// (but usually not needed – default is good)
 				return slog.String(slog.TimeKey, a.Value.Time().Format(time.RFC3339Nano))
 			}
 			return a
@@ -36,7 +33,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	memoryRepo := memory.NewMemoryDB()
+	memoryRepo := memory.NewMemoryDB(config)
 	r, err := raft.NewRaftService(memoryRepo, config)
 	if err != nil {
 		slog.Error("failed to create memory db", "error", err)
