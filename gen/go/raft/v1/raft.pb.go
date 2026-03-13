@@ -7,12 +7,11 @@
 package raft
 
 import (
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
-
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -382,6 +381,102 @@ func (x *AppendEntriesResponse) GetSuccess() bool {
 	return false
 }
 
+type SubmitRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Data          []byte                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmitRequest) Reset() {
+	*x = SubmitRequest{}
+	mi := &file_raft_v1_raft_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmitRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmitRequest) ProtoMessage() {}
+
+func (x *SubmitRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_v1_raft_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmitRequest.ProtoReflect.Descriptor instead.
+func (*SubmitRequest) Descriptor() ([]byte, []int) {
+	return file_raft_v1_raft_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *SubmitRequest) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+type SubmitResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	LeaderId      string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmitResponse) Reset() {
+	*x = SubmitResponse{}
+	mi := &file_raft_v1_raft_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmitResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmitResponse) ProtoMessage() {}
+
+func (x *SubmitResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_v1_raft_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmitResponse.ProtoReflect.Descriptor instead.
+func (*SubmitResponse) Descriptor() ([]byte, []int) {
+	return file_raft_v1_raft_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *SubmitResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *SubmitResponse) GetLeaderId() string {
+	if x != nil {
+		return x.LeaderId
+	}
+	return ""
+}
+
 var File_raft_v1_raft_proto protoreflect.FileDescriptor
 
 const file_raft_v1_raft_proto_rawDesc = "" +
@@ -407,16 +502,22 @@ const file_raft_v1_raft_proto_rawDesc = "" +
 	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"E\n" +
 	"\x15AppendEntriesResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess*@\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"#\n" +
+	"\rSubmitRequest\x12\x12\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"G\n" +
+	"\x0eSubmitResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1b\n" +
+	"\tleader_id\x18\x02 \x01(\tR\bleaderId*@\n" +
 	"\x04Role\x12\x0f\n" +
 	"\vUNSPECIFIED\x10\x00\x12\f\n" +
 	"\bFOLLOWER\x10\x01\x12\r\n" +
 	"\tCANDIDATE\x10\x02\x12\n" +
 	"\n" +
-	"\x06LEADER\x10\x032\xa7\x01\n" +
+	"\x06LEADER\x10\x032\xe2\x01\n" +
 	"\vRaftService\x12H\n" +
 	"\vRequestVote\x12\x1b.raft.v1.RequestVoteRequest\x1a\x1c.raft.v1.RequestVoteResponse\x12N\n" +
-	"\rAppendEntries\x12\x1d.raft.v1.AppendEntriesRequest\x1a\x1e.raft.v1.AppendEntriesResponseB+Z)github.com/alipourhabibi/raft/gen/go/raftb\x06proto3"
+	"\rAppendEntries\x12\x1d.raft.v1.AppendEntriesRequest\x1a\x1e.raft.v1.AppendEntriesResponse\x129\n" +
+	"\x06Submit\x12\x16.raft.v1.SubmitRequest\x1a\x17.raft.v1.SubmitResponseB+Z)github.com/alipourhabibi/raft/gen/go/raftb\x06proto3"
 
 var (
 	file_raft_v1_raft_proto_rawDescOnce sync.Once
@@ -431,7 +532,7 @@ func file_raft_v1_raft_proto_rawDescGZIP() []byte {
 }
 
 var file_raft_v1_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_raft_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_raft_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_raft_v1_raft_proto_goTypes = []any{
 	(Role)(0),                     // 0: raft.v1.Role
 	(*Entry)(nil),                 // 1: raft.v1.Entry
@@ -439,15 +540,19 @@ var file_raft_v1_raft_proto_goTypes = []any{
 	(*RequestVoteResponse)(nil),   // 3: raft.v1.RequestVoteResponse
 	(*AppendEntriesRequest)(nil),  // 4: raft.v1.AppendEntriesRequest
 	(*AppendEntriesResponse)(nil), // 5: raft.v1.AppendEntriesResponse
+	(*SubmitRequest)(nil),         // 6: raft.v1.SubmitRequest
+	(*SubmitResponse)(nil),        // 7: raft.v1.SubmitResponse
 }
 var file_raft_v1_raft_proto_depIdxs = []int32{
 	1, // 0: raft.v1.AppendEntriesRequest.entries:type_name -> raft.v1.Entry
 	2, // 1: raft.v1.RaftService.RequestVote:input_type -> raft.v1.RequestVoteRequest
 	4, // 2: raft.v1.RaftService.AppendEntries:input_type -> raft.v1.AppendEntriesRequest
-	3, // 3: raft.v1.RaftService.RequestVote:output_type -> raft.v1.RequestVoteResponse
-	5, // 4: raft.v1.RaftService.AppendEntries:output_type -> raft.v1.AppendEntriesResponse
-	3, // [3:5] is the sub-list for method output_type
-	1, // [1:3] is the sub-list for method input_type
+	6, // 3: raft.v1.RaftService.Submit:input_type -> raft.v1.SubmitRequest
+	3, // 4: raft.v1.RaftService.RequestVote:output_type -> raft.v1.RequestVoteResponse
+	5, // 5: raft.v1.RaftService.AppendEntries:output_type -> raft.v1.AppendEntriesResponse
+	7, // 6: raft.v1.RaftService.Submit:output_type -> raft.v1.SubmitResponse
+	4, // [4:7] is the sub-list for method output_type
+	1, // [1:4] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
 	1, // [1:1] is the sub-list for extension extendee
 	0, // [0:1] is the sub-list for field type_name
@@ -464,7 +569,7 @@ func file_raft_v1_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_raft_v1_raft_proto_rawDesc), len(file_raft_v1_raft_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   5,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -27,6 +27,8 @@ type Raft struct {
 	clients    map[string]raftpb.RaftServiceClient
 
 	heartbeatCh chan struct{}
+
+	lastKnownLeader string
 }
 
 func NewRaftService(
@@ -64,6 +66,18 @@ func (r *Raft) getRole() raftpb.Role {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.role
+}
+
+func (r *Raft) setLeader(leaderId string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastKnownLeader = leaderId
+}
+
+func (r *Raft) getLastKnownLeader() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastKnownLeader
 }
 
 // This method is the logic loop and runs infinitely
@@ -352,6 +366,9 @@ func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) error {
 		return err
 	}
 
+	// +1 because majority means more than half of ALL nodes (including leader)
+	majority := len(r.clients)/2 + 1
+
 	for n := lastLogIndex; n > commitIndex; n-- {
 		entry, err := r.repository.GetEntryAtIndex(ctx, n)
 		if err != nil {
@@ -372,8 +389,6 @@ func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) error {
 			}
 		}
 
-		// +1 because majority means more than half of ALL nodes (including leader)
-		majority := len(r.clients)/2 + 1
 		if replicatedCount >= majority {
 			// Found the highest safely committable index
 			return r.repository.SetCommitIndex(ctx, n)
@@ -483,6 +498,8 @@ func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReque
 		return &raftpb.AppendEntriesResponse{Success: false, Term: currentTerm}, nil
 	}
 
+	r.setLeader(req.LeaderId)
+
 	if len(req.Entries) > 0 {
 		if err = r.repository.AppendEntries(ctx, req.PrevLogIndex, req.Entries); err != nil {
 			return nil, err
@@ -502,4 +519,68 @@ func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReque
 		Term:    req.Term,
 		Success: true,
 	}, nil
+}
+
+func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.SubmitResponse, error) {
+	role := r.getRole()
+
+	if role != raftpb.Role_LEADER {
+		lastKnownLeader := r.getLastKnownLeader()
+		return &raftpb.SubmitResponse{
+			Success:  false,
+			LeaderId: lastKnownLeader,
+		}, nil
+	}
+
+	term, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	entry := &raftpb.Entry{
+		Term:    term,
+		Command: string(req.Data),
+	}
+
+	lasetLogIndex, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := r.repository.AppendEntries(ctx, lasetLogIndex, []*raftpb.Entry{entry}); err != nil {
+		return nil, err
+	}
+
+	entryIndex := lasetLogIndex + 1
+
+	if err := r.waitForCommit(ctx, entryIndex); err != nil {
+		return nil, err
+	}
+
+	slog.Debug("Submit succeeded", "term", term, "entryIndex", entryIndex)
+	return &raftpb.SubmitResponse{Success: true}, nil
+}
+
+func (r *Raft) waitForCommit(ctx context.Context, index uint64) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	// timeout so the client doesn't wait forever
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for index %d to commit", index)
+		case <-ticker.C:
+			commitIndex, err := r.repository.GetCommitIndex(ctx)
+			if err != nil {
+				return err
+			}
+			if commitIndex >= index {
+				return nil
+			}
+		}
+	}
 }

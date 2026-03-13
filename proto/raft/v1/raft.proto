@@ -42,7 +42,17 @@ message AppendEntriesResponse {
   bool success = 2;
 }
 
+message SubmitRequest {
+  bytes data = 1;
+}
+
+message SubmitResponse {
+  bool success = 1;
+  string leader_id = 2;
+}
+
 service RaftService {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
 }
