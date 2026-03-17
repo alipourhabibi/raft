@@ -174,6 +174,7 @@ func (r *Raft) applyEntry(entry *raftpb.Entry) error {
 	return nil
 }
 
+// TODO make it concurrent for sending AppendEntries
 func (r *Raft) sendHeartbeat() error {
 	ctx := context.Background()
 

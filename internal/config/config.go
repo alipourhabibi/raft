@@ -17,6 +17,12 @@ type Config struct {
 	Nodes map[string]string `env:"NODES"` // nodeID: url
 
 	HeartbeatTimeout uint64 `env:"HEARTBEAT_TIMEOUT"`
+
+	RedisHost     string `env:"REDIS_HOST"`
+	RedisPassword string `env:"REDIS_PASSWORD"`
+	RedisDB       int    `env:"REDIS_DB"`
+
+	DBType string `env:"DB_TYPE"`
 }
 
 func NewConfig() (*Config, error) {

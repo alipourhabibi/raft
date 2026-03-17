@@ -52,6 +52,7 @@ rm -f raft-node*.log
 
 echo "Starting nodes..."
 
+i=3
 for name in "${!NODES[@]}"; do
   port="${NODES[$name]}"
 
@@ -64,6 +65,7 @@ for name in "${!NODES[@]}"; do
   peers_str=$(IFS=','; echo "${peers[*]}")
 
   (
+    REDIS_DB=$i \
     PORT="$port" \
     ID="$name" \
     NODES="$peers_str" \
@@ -71,6 +73,7 @@ for name in "${!NODES[@]}"; do
   ) > "raft-${name}.log" &
 
   PIDS+=($!)
+  ((i--))
 done
 
 echo "Nodes started: ${PIDS[*]}"

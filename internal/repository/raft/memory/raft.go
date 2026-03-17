@@ -147,6 +147,7 @@ func (m *MemoryDB) GetLastLogIndex(ctx context.Context) (uint64, error) {
 
 // AppendEntries persists entries starting after prevLogIndex,
 // truncating any conflicting entries first
+// TODO should be checked
 func (m *MemoryDB) AppendEntries(ctx context.Context, prevLogIndex uint64, entries []*raftpb.Entry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

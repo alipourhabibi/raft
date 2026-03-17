@@ -7,8 +7,11 @@ import (
 	"time"
 
 	"github.com/alipourhabibi/raft/internal/config"
+	redisinfra "github.com/alipourhabibi/raft/internal/infrastructure/redis"
 	"github.com/alipourhabibi/raft/internal/raft"
+	reaftrep "github.com/alipourhabibi/raft/internal/repository/raft"
 	"github.com/alipourhabibi/raft/internal/repository/raft/memory"
+	"github.com/alipourhabibi/raft/internal/repository/raft/redis"
 	"github.com/alipourhabibi/raft/internal/transport/grpc"
 	"golang.org/x/sync/errgroup"
 )
@@ -27,20 +30,40 @@ func main() {
 	logger := slog.New(handler)
 	slog.SetDefault(logger)
 
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
 	config, err := config.NewConfig()
 	if err != nil {
 		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
 
-	memoryRepo := memory.NewMemoryDB(config)
-	r, err := raft.NewRaftService(memoryRepo, config)
+	redisInfra, err := redisinfra.NewRedis(ctx, config)
+	if err != nil {
+		slog.Error("failed to init redis inra", "error", err)
+		os.Exit(1)
+	}
+
+	var repo reaftrep.RaftRepository
+	if config.DBType == "redis" {
+		repo, err = redis.NewRedisDB(ctx, config, redisInfra)
+		if err != nil {
+			slog.Error("failed to init redis", "error", err)
+			os.Exit(1)
+		}
+	} else {
+		repo = memory.NewMemoryDB(config)
+	}
+
+	r, err := raft.NewRaftService(repo, config)
 	if err != nil {
 		slog.Error("failed to create memory db", "error", err)
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
 	g, ctx := errgroup.WithContext(ctx)
