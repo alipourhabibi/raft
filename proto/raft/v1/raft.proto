@@ -43,7 +43,7 @@ message AppendEntriesResponse {
 }
 
 message SubmitRequest {
-  bytes data = 1;
+  string data = 1;
 }
 
 message SubmitResponse {

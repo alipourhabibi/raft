@@ -1,6 +1,7 @@
 package grpc
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -27,10 +28,16 @@ func NewGrpcServer(
 	}
 }
 
-func (g *GrpcServer) Boot() error {
+func (g *GrpcServer) Boot(ctx context.Context) error {
 	grpcServer := grpc.NewServer()
 	raftpb.RegisterRaftServiceServer(grpcServer, g.raftService)
 	reflection.Register(grpcServer)
+
+	go func() {
+		<-ctx.Done()
+		slog.Info("shutting down grpc server")
+		grpcServer.GracefulStop()
+	}()
 
 	slog.Info("Starting grpc server", "port", g.port)
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", g.port))

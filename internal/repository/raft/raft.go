@@ -24,7 +24,7 @@ type RaftRepository interface {
 
 	InitLeaderState(ctx context.Context) error
 
-	AppendEntries(ctx context.Context, prevLogIndex uint64, entries []*raftpb.Entry) error
+	TruncateAndAppend(ctx context.Context, fromIndex uint64, entries []*raftpb.Entry) error
 	SetNextIndex(ctx context.Context, nodeID string, index uint64) error
 	SetMatchIndex(ctx context.Context, nodeID string, index uint64) error
 	SetCommitIndex(ctx context.Context, index uint64) error

@@ -174,41 +174,18 @@ func (r *RedisDB) GetEntryFromIndex(ctx context.Context, index uint64) ([]*raftp
 	return entries, nil
 }
 
-// TODO should check this to be sure
-func (r *RedisDB) AppendEntries(ctx context.Context, prevLogIndex uint64, entries []*raftpb.Entry) error {
-	for i, entry := range entries {
-		absIdx := int64(prevLogIndex) + 1 + int64(i)
-
-		existing, err := r.redis.Client.LIndex(ctx, LOGS_KEY, absIdx).Bytes()
-		if err != nil && !errors.Is(err, goredis.Nil) {
-			return fmt.Errorf("lindex %d: %w", absIdx, err)
+// TruncateAndAppend truncates the log after index and appends entries from that point.
+func (r *RedisDB) TruncateAndAppend(ctx context.Context, fromIndex uint64, entries []*raftpb.Entry) error {
+	if err := r.redis.Client.LTrim(ctx, LOGS_KEY, 0, int64(fromIndex)).Err(); err != nil {
+		return fmt.Errorf("ltrim: %w", err)
+	}
+	for _, entry := range entries {
+		raw, err := marshalEntry(entry)
+		if err != nil {
+			return fmt.Errorf("marshal entry: %w", err)
 		}
-
-		if existing != nil {
-			existingEntry, err := unmarshalEntry(existing)
-			if err != nil {
-				return fmt.Errorf("unmarshal existing entry at %d: %w", absIdx, err)
-			}
-			if existingEntry.Term != entry.Term {
-				if err := r.redis.Client.LTrim(ctx, LOGS_KEY, 0, absIdx-1).Err(); err != nil {
-					return fmt.Errorf("ltrim at %d: %w", absIdx, err)
-				}
-				raw, err := marshalEntry(entry)
-				if err != nil {
-					return fmt.Errorf("marshal entry: %w", err)
-				}
-				if err := r.redis.Client.RPush(ctx, LOGS_KEY, raw).Err(); err != nil {
-					return fmt.Errorf("rpush after truncation: %w", err)
-				}
-			}
-		} else {
-			raw, err := marshalEntry(entry)
-			if err != nil {
-				return fmt.Errorf("marshal entry: %w", err)
-			}
-			if err := r.redis.Client.RPush(ctx, LOGS_KEY, raw).Err(); err != nil {
-				return fmt.Errorf("rpush: %w", err)
-			}
+		if err := r.redis.Client.RPush(ctx, LOGS_KEY, raw).Err(); err != nil {
+			return fmt.Errorf("rpush: %w", err)
 		}
 	}
 	return nil

@@ -145,25 +145,12 @@ func (m *MemoryDB) GetLastLogIndex(ctx context.Context) (uint64, error) {
 	return uint64(len(m.logs) - 1), nil // sentinel is at 0, so -1 is safe
 }
 
-// AppendEntries persists entries starting after prevLogIndex,
-// truncating any conflicting entries first
-// TODO should be checked
-func (m *MemoryDB) AppendEntries(ctx context.Context, prevLogIndex uint64, entries []*raftpb.Entry) error {
+// TruncateAndAppend truncates the log after index and appends entries from that point.
+func (m *MemoryDB) TruncateAndAppend(ctx context.Context, fromIndex uint64, entries []*raftpb.Entry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for i, entry := range entries {
-		absIdx := int(prevLogIndex) + 1 + i // absolute position in the log
-		if absIdx < len(m.logs) {
-			if m.logs[absIdx].Term != entry.Term {
-				// Conflict: truncate from this point forward
-				m.logs = m.logs[:absIdx]
-				m.logs = append(m.logs, entry)
-			}
-			// same term at same position - already have it, skip
-		} else {
-			m.logs = append(m.logs, entry)
-		}
-	}
+	m.logs = m.logs[:fromIndex+1]
+	m.logs = append(m.logs, entries...)
 	return nil
 }
 

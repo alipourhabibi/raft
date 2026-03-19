@@ -383,7 +383,7 @@ func (x *AppendEntriesResponse) GetSuccess() bool {
 
 type SubmitRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Data          []byte                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	Data          string                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -418,11 +418,11 @@ func (*SubmitRequest) Descriptor() ([]byte, []int) {
 	return file_raft_v1_raft_proto_rawDescGZIP(), []int{5}
 }
 
-func (x *SubmitRequest) GetData() []byte {
+func (x *SubmitRequest) GetData() string {
 	if x != nil {
 		return x.Data
 	}
-	return nil
+	return ""
 }
 
 type SubmitResponse struct {
@@ -504,7 +504,7 @@ const file_raft_v1_raft_proto_rawDesc = "" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\"#\n" +
 	"\rSubmitRequest\x12\x12\n" +
-	"\x04data\x18\x01 \x01(\fR\x04data\"G\n" +
+	"\x04data\x18\x01 \x01(\tR\x04data\"G\n" +
 	"\x0eSubmitResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\tR\bleaderId*@\n" +

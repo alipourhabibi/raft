@@ -4,14 +4,20 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/alipourhabibi/raft/internal/config"
 	redisinfra "github.com/alipourhabibi/raft/internal/infrastructure/redis"
 	"github.com/alipourhabibi/raft/internal/raft"
-	reaftrep "github.com/alipourhabibi/raft/internal/repository/raft"
+	raftrep "github.com/alipourhabibi/raft/internal/repository/raft"
 	"github.com/alipourhabibi/raft/internal/repository/raft/memory"
-	"github.com/alipourhabibi/raft/internal/repository/raft/redis"
+	raftredis "github.com/alipourhabibi/raft/internal/repository/raft/redis"
+	staterep "github.com/alipourhabibi/raft/internal/repository/statemachine"
+	statemachinememroy "github.com/alipourhabibi/raft/internal/repository/statemachine/memory"
+	stateredis "github.com/alipourhabibi/raft/internal/repository/statemachine/redis"
+	"github.com/alipourhabibi/raft/internal/statemachine"
 	"github.com/alipourhabibi/raft/internal/transport/grpc"
 	"golang.org/x/sync/errgroup"
 )
@@ -46,31 +52,45 @@ func main() {
 		os.Exit(1)
 	}
 
-	var repo reaftrep.RaftRepository
+	var stateMachineRepo staterep.StateMachineRepo
+
+	var repo raftrep.RaftRepository
 	if config.DBType == "redis" {
-		repo, err = redis.NewRedisDB(ctx, config, redisInfra)
+		repo, err = raftredis.NewRedisDB(ctx, config, redisInfra)
 		if err != nil {
 			slog.Error("failed to init redis", "error", err)
 			os.Exit(1)
 		}
+		stateMachineRepo, err = stateredis.NewRedisStateMachine(ctx, redisInfra)
+		if err != nil {
+			slog.Error("failed to init statemachine redis", "error", err)
+			os.Exit(1)
+		}
 	} else {
 		repo = memory.NewMemoryDB(config)
+		stateMachineRepo = statemachinememroy.NewMemoryStateMachine(ctx)
 	}
 
-	r, err := raft.NewRaftService(repo, config)
+	s, err := statemachine.NewStateMachine(config, stateMachineRepo)
+	if err != nil {
+		slog.Error("failed to init state machine service", "error", err)
+		os.Exit(1)
+	}
+
+	r, err := raft.NewRaftService(repo, config, s)
 	if err != nil {
 		slog.Error("failed to create memory db", "error", err)
 		os.Exit(1)
 	}
 
-	ctx, cancel = context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		grpcServer := grpc.NewGrpcServer(config, r)
-		if err := grpcServer.Boot(); err != nil {
+		if err := grpcServer.Boot(ctx); err != nil {
 			slog.Error("failed to boot grpc server", "error", err)
 			return err
 		}
@@ -78,7 +98,7 @@ func main() {
 	})
 
 	g.Go(func() error {
-		err := r.Serve()
+		err := r.Serve(ctx)
 		if err != nil {
 			slog.Error("failed to serve raft")
 			return err
