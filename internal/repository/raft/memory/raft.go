@@ -2,17 +2,21 @@ package memory
 
 import (
 	"context"
-	"errors"
 	"sync"
 
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
+	"github.com/alipourhabibi/raft/internal/repository/raft"
 )
 
 func NewMemoryDB(config *config.Config) *MemoryDB {
 
 	nextIndex := map[string]uint64{}
 	matchIndex := map[string]uint64{}
+	clusterConfig := &raftpb.ClusterConfig{
+		Nodes: config.Nodes,
+	}
+
 	for nodeID := range config.Nodes {
 		nextIndex[nodeID] = 1 // starts at 1
 		matchIndex[nodeID] = 0
@@ -30,6 +34,8 @@ func NewMemoryDB(config *config.Config) *MemoryDB {
 
 		nextIndex:  nextIndex,
 		matchIndex: matchIndex,
+
+		clusterConfig: clusterConfig,
 	}
 }
 
@@ -48,6 +54,9 @@ type MemoryDB struct {
 	// leader data
 	nextIndex  map[string]uint64 // nodeID: index, next log entry to send to that peer (optimistic)
 	matchIndex map[string]uint64 // nodeID: highest entry confirmed replicated on that peer (conservative) nextIndex = matchIndex + 1 in the steady state
+
+	// Cluster
+	clusterConfig *raftpb.ClusterConfig
 }
 
 func (m *MemoryDB) GetCurrentTerm(context.Context) (uint64, error) {
@@ -120,7 +129,7 @@ func (m *MemoryDB) GetEntryAtIndex(ctx context.Context, index uint64) (*raftpb.E
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if int(index) >= len(m.logs) {
-		return nil, errors.New("index out of range")
+		return nil, raft.ErrIndexOutofRange
 	}
 	return m.logs[index], nil
 }
@@ -189,4 +198,19 @@ func (m *MemoryDB) GetNextIndexByNodeID(ctx context.Context, nodeID string) (uin
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.nextIndex[nodeID], nil
+}
+
+func (m *MemoryDB) GetClusterConfig(ctx context.Context) (*raftpb.ClusterConfig, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.clusterConfig, nil
+}
+
+func (m *MemoryDB) SetClusterConfig(ctx context.Context, config *raftpb.ClusterConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.clusterConfig = config
+	return nil
 }

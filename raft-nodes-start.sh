@@ -8,6 +8,8 @@ declare -A NODES=(
   [node1]=50051
   [node2]=50052
   [node3]=50053
+  [node4]=50054
+  [node5]=50055
 )
 
 PIDS=()
@@ -52,7 +54,7 @@ rm -f raft-node*.log
 
 echo "Starting nodes..."
 
-i=3
+i=5
 for name in "${!NODES[@]}"; do
   port="${NODES[$name]}"
 
@@ -64,13 +66,16 @@ for name in "${!NODES[@]}"; do
 
   peers_str=$(IFS=','; echo "${peers[*]}")
 
-  (
-    REDIS_DB=$i \
-    PORT="$port" \
-    ID="$name" \
-    NODES="$peers_str" \
-    stdbuf -oL -eL go run . 2>&1 | sed "s/^/${name} | /"
-  ) > "raft-${name}.log" &
+  cmd='(
+    REDIS_DB='"$i"' \
+    PORT="'"$port"'" \
+    ID="'"$name"'" \
+    NODES="'"$peers_str"'" \
+    stdbuf -oL -eL go run . 2>&1 | sed "s/^/'"$name"' | /"
+  ) > "raft-'"$name"'.log" &'
+  
+  echo "$cmd"
+  eval "$cmd"
 
   PIDS+=($!)
   ((i--))

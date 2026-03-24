@@ -11,9 +11,21 @@ enum Role {
   LEADER = 3;
 }
 
+enum EntryType {
+  ENTRY_TYPE_COMMAND = 0;
+  ENTRY_TYPE_CONFIG = 1; // C_new (phase 2)
+  ENTRY_TYPE_CONFIG_JOINT = 2; // C_old,new (phase 1)
+}
+
+message ClusterConfig {
+  map<string, string> nodes = 3;
+}
+
 message Entry {
   string command = 1;
   uint64 term = 2;
+  EntryType type = 3;
+  ClusterConfig config = 4;
 }
 
 message RequestVoteRequest {
@@ -51,8 +63,20 @@ message SubmitResponse {
   string leader_id = 2;
 }
 
+message ChangeNodesRequest {
+  repeated string add_ids    = 1;
+  repeated string remove_ids = 2;
+  map<string, string> add_nodes = 3; // id → url for new nodes
+}
+
+message ChangeNodesResponse {
+  bool success = 1;
+  optional string leader_id = 2;
+}
+
 service RaftService {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc Submit(SubmitRequest) returns (SubmitResponse);
+  rpc ChangeNodes(ChangeNodesRequest) returns (ChangeNodesResponse);
 }

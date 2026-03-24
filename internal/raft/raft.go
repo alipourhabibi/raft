@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
+	"maps"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -16,6 +16,7 @@ import (
 	"github.com/alipourhabibi/raft/internal/statemachine"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 )
 
 type Raft struct {
@@ -25,12 +26,21 @@ type Raft struct {
 	repository   repository.RaftRepository
 	role         raftpb.Role
 	config       *config.Config
-	clients      map[string]raftpb.RaftServiceClient
 	stateMachine statemachine.StateMachine
 
 	heartbeatCh chan struct{}
 
 	lastKnownLeader string
+	lastHeartbeat   time.Time
+
+	// nodes
+	isJoint bool
+	// clients gRPC stubs - always the union of cOld ∪ cNew (minus self)
+	clients map[string]raftpb.RaftServiceClient
+	// stable config
+	cOld map[string]string
+	// only in isJoint and nil otherwise
+	cNew map[string]string
 }
 
 func NewRaftService(
@@ -38,9 +48,37 @@ func NewRaftService(
 	config *config.Config,
 	stateMachine statemachine.StateMachine,
 ) (*Raft, error) {
+	ctx := context.Background()
+
+	if config.Host == "" {
+		config.Host = fmt.Sprintf("%s:%d", "localhost", config.Port)
+	}
+
+	// Load the previous nodes if persisted in cluster
+	persisted, err := repository.GetClusterConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load cluster config: %w", err)
+	}
+
+	var cold map[string]string
+	if persisted != nil && len(persisted.Nodes) > 0 {
+		cold = persisted.Nodes
+	} else {
+		cold = maps.Clone(config.Nodes)
+		cold[config.ID] = config.Host
+		if err := repository.SetClusterConfig(ctx, &raftpb.ClusterConfig{
+			Nodes: cold,
+		}); err != nil {
+			slog.Error("failed to set ClusterConfig", "error", err)
+		}
+	}
+
 	clients := map[string]raftpb.RaftServiceClient{}
 
-	for k, v := range config.Nodes {
+	for k, v := range cold {
+		if k == config.ID {
+			continue
+		}
 		conn, err := grpc.NewClient(
 			v,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -51,13 +89,131 @@ func NewRaftService(
 		clients[k] = raftpb.NewRaftServiceClient(conn)
 	}
 	return &Raft{
-		config:       config,
-		repository:   repository,
-		role:         raftpb.Role_FOLLOWER,
-		heartbeatCh:  make(chan struct{}),
-		clients:      clients,
-		stateMachine: stateMachine,
+		config:        config,
+		repository:    repository,
+		role:          raftpb.Role_FOLLOWER,
+		heartbeatCh:   make(chan struct{}),
+		clients:       clients,
+		stateMachine:  stateMachine,
+		cOld:          cold,
+		lastHeartbeat: time.Now(),
 	}, nil
+}
+
+// the replicatedOn is a function that carries if the nodeID has voted
+func (r *Raft) quorumReached(replicatedOn func(nodeID string) bool) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if !r.isJoint {
+		return r.countQuorum(r.cOld, replicatedOn)
+	}
+
+	return r.countQuorum(r.cOld, replicatedOn) && r.countQuorum(r.cNew, replicatedOn)
+}
+
+func (r *Raft) countQuorum(members map[string]string, has func(nodeID string) bool) bool {
+	need := len(members)/2 + 1
+	got := 0
+	for id := range members {
+		if has(id) {
+			got++
+		}
+	}
+	return got >= need
+}
+
+func (r *Raft) peerSnapshot() map[string]raftpb.RaftServiceClient {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return maps.Clone(r.clients)
+}
+
+// enterJoint activates joint-consensus mode.  It is idempotent; calling it
+// again with the same cnew is a no-op.
+// Must be called before the C_old,new entry is appended so that quorum checks
+// during replication already use both configs (Raft §6).
+func (r *Raft) enterJoint(_ context.Context, cnew map[string]string) error {
+	slog.Info("entering joint consensus mode", "cOld", r.cOld, "cNew", r.cNew)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.isJoint {
+		return nil
+	}
+
+	clients := maps.Clone(r.clients)
+
+	for id, url := range cnew {
+		if id == r.config.ID {
+			continue
+		}
+		if _, exists := clients[id]; !exists {
+			conn, err := grpc.NewClient(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return fmt.Errorf("dial new node %s (%s): %w", id, url, err)
+			}
+			clients[id] = raftpb.NewRaftServiceClient(conn)
+			slog.Debug("adding to cluster", "nodeID", id)
+		}
+	}
+	r.cNew = cnew
+	r.isJoint = true
+	r.clients = clients
+
+	slog.Info("entered joint consensus mode", "cOld", r.cOld, "cNew", r.cNew)
+	return nil
+}
+
+// exitJoint finalises the membership change by promoting cNew → cOld, closing
+// connections for removed nodes, and stepping down if we removed ourselves.
+// Called when the C_new entry is applied.
+func (r *Raft) exitJoint(_ context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	slog.Debug("exiting", "node", r.config.ID)
+	if !r.isJoint {
+		return nil
+	}
+
+	for id := range r.cOld {
+		if _, keep := r.cNew[id]; !keep {
+			delete(r.clients, id)
+			slog.Info("removed node from cluster", "nodeID", id)
+		}
+	}
+
+	r.cOld = r.cNew
+	r.cNew = nil
+	r.isJoint = false
+
+	// If we removed ourselves, step down immediately.
+	if _, isMember := r.cOld[r.config.ID]; !isMember {
+		r.stepDown()
+	}
+
+	slog.Info("exited joint consensus", "cNew", r.cOld)
+	return nil
+}
+
+func (r *Raft) stepDown() {
+	r.role = raftpb.Role_FOLLOWER
+	// NOTE this is not right and i just added it due to the problem for the raft membership change so i can test
+	r.cOld = map[string]string{}
+	r.clients = map[string]raftpb.RaftServiceClient{}
+	slog.Info("removed self from cluster, stepping down")
+}
+
+func (r *Raft) setHeartbeatTime() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastHeartbeat = time.Now()
+}
+
+func (r *Raft) getHeartbeatTime() time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastHeartbeat
 }
 
 func (r *Raft) changeRole(role raftpb.Role) {
@@ -106,7 +262,7 @@ func (r *Raft) Serve(ctx context.Context) error {
 				return ctx.Err()
 
 			case <-ticker:
-				slog.Debug("ticker ticked", "role", r.role, "timeoutMs", timeoutMs)
+				slog.Debug("ticker ticked", "role", r.getRole(), "timeoutMs", timeoutMs)
 				r.changeRole(raftpb.Role_CANDIDATE)
 				err := r.startElection()
 				if err != nil {
@@ -115,12 +271,13 @@ func (r *Raft) Serve(ctx context.Context) error {
 					r.changeRole(raftpb.Role_LEADER)
 					if err := r.repository.InitLeaderState(ctx); err != nil {
 						slog.Error("failed to init leader state", "error", err)
-						r.role = raftpb.Role_FOLLOWER
+						r.changeRole(raftpb.Role_FOLLOWER)
 					}
 					slog.Debug("start election succeeded", "role", r.role)
 				}
 			case <-r.heartbeatCh:
 				slog.Debug("heartbeat received", "role", r.role)
+				r.setHeartbeatTime()
 				r.changeRole(raftpb.Role_FOLLOWER)
 			}
 
@@ -139,9 +296,11 @@ func (r *Raft) Serve(ctx context.Context) error {
 				if err != nil {
 					slog.Error("failed to send heartbeat", "error", err)
 				}
+				r.setHeartbeatTime()
 			case <-r.heartbeatCh:
+				slog.Debug("heartbeat received", "role", "leader", "timeoutMs", timeoutMs)
+				r.setHeartbeatTime()
 				r.changeRole(raftpb.Role_FOLLOWER)
-				slog.Debug("heartbeat received as leader")
 			}
 		}
 	}
@@ -149,7 +308,64 @@ func (r *Raft) Serve(ctx context.Context) error {
 
 func (r *Raft) applyEntry(ctx context.Context, entry *raftpb.Entry) error {
 	slog.Debug("applying entry", "term", entry.Term, "data", entry)
-	return r.stateMachine.Apply(ctx, entry)
+
+	switch entry.Type {
+	case raftpb.EntryType_ENTRY_TYPE_CONFIG_JOINT:
+		// Phase-1 entry committed
+		// Followers enter joint here, leader already entered
+		if err := r.enterJoint(ctx, entry.Config.Nodes); err != nil {
+			return err
+		}
+		if err := r.repository.SetClusterConfig(ctx, entry.Config); err != nil {
+			return err
+		}
+		if r.getRole() == raftpb.Role_LEADER {
+			go func() {
+				if err := r.appendFinalConfig(context.Background()); err != nil {
+					slog.Error("failed to append C_new after joint commit", "error", err)
+				}
+			}()
+		}
+		return nil
+	case raftpb.EntryType_ENTRY_TYPE_CONFIG:
+		// Phase-2 entry committed: finalise the membership change.
+		if err := r.exitJoint(ctx); err != nil {
+			return err
+		}
+		return r.repository.SetClusterConfig(ctx, entry.Config)
+	default:
+		return r.stateMachine.Apply(ctx, entry)
+	}
+}
+
+// appendFinalConfig appends the C_new log entry (phase 2) after C_old,new
+// has been committed.  Called in a goroutine by the leader.
+func (r *Raft) appendFinalConfig(ctx context.Context) error {
+	term, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return err
+	}
+	lastIdx, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		return err
+	}
+
+	r.mu.RLock()
+	cNew := maps.Clone(r.cNew)
+	r.mu.RUnlock()
+
+	if cNew == nil {
+		return errors.New("appendFinalConfig called but cNew is nil")
+	}
+
+	entry := &raftpb.Entry{
+		Term:   term,
+		Type:   raftpb.EntryType_ENTRY_TYPE_CONFIG,
+		Config: &raftpb.ClusterConfig{Nodes: cNew},
+	}
+
+	slog.Info("appendFinalConfig", "entry", entry)
+	return r.repository.TruncateAndAppend(ctx, lastIdx, []*raftpb.Entry{entry})
 }
 
 func (r *Raft) applyCommitted(ctx context.Context) error {
@@ -161,6 +377,7 @@ func (r *Raft) applyCommitted(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	slog.Debug("Starting applyCommitted", "lastApplied", lastApplied, "commitIndex", commitIndex)
 	for i := lastApplied + 1; i <= commitIndex; i++ {
 		entry, err := r.repository.GetEntryAtIndex(ctx, i)
 		if err != nil {
@@ -183,8 +400,10 @@ func (r *Raft) sendHeartbeat() error {
 		return err
 	}
 
+	peers := r.peerSnapshot()
+
 	var wg sync.WaitGroup
-	for id, v := range r.clients {
+	for id, v := range peers {
 		wg.Add(1)
 		go func(id string, v raftpb.RaftServiceClient) {
 			defer wg.Done()
@@ -233,6 +452,7 @@ func (r *Raft) sendHeartbeat() error {
 					}
 					return
 				}
+				// Back off next index and retry on the next heartbeat.
 				if nextIdx > 1 {
 					if err = r.repository.SetNextIndex(ctx, id, nextIdx-1); err != nil {
 						slog.Error("failed to decrement nextIndex", "nodeID", id, "error", err)
@@ -292,65 +512,81 @@ func (r *Raft) startElection() error {
 		return err
 	}
 
-	// sucessRate is the number of *other* nodes we need votes from.
-	// The leader already counts its own vote implicitly (via VoteFor above),
-	// so majority = ceil((total_nodes) / 2) = ceil((len(clients)+1) / 2).
-	// Because len(clients) = total-1, ceil(len(clients)/2) gives the same
-	// result for the remaining votes needed. Examples:
-	//   3-node cluster: clients=2 → ceil(2/2)=1 → need 1 of 2 others ✓
-	//   5-node cluster: clients=4 → ceil(4/2)=2 → need 2 of 4 others ✓
-	neededVotes := int(math.Ceil(float64(len(r.clients)) / 2))
+	r.mu.RLock()
+	peers := maps.Clone(r.clients) // union of cOld ∪ cNew already
+	coldSnapshot := maps.Clone(r.cOld)
+	cnewSnapshot := maps.Clone(r.cNew) // nil when not in joint
+	inJoint := r.isJoint
+	r.mu.RUnlock()
 
-	type result struct {
+	type voteResult struct {
+		nodeID  string
 		granted bool
 		term    uint64
 	}
-	resultCh := make(chan result, len(r.clients))
+	resultCh := make(chan voteResult, len(peers))
 
-	for _, v := range r.clients {
-		go func() {
+	for id, client := range peers {
+		go func(id string, client raftpb.RaftServiceClient) {
 			ctx2, cancel := context.WithTimeout(ctx, 1000*time.Millisecond)
 			defer cancel()
-			resp, err := v.RequestVote(ctx2, &raftpb.RequestVoteRequest{
+			resp, err := client.RequestVote(ctx2, &raftpb.RequestVoteRequest{
 				Term:         newTerm,
 				CandidateId:  r.config.ID,
 				LastLogIndex: lastLogIndex,
 				LastLogTerm:  lastLogEntry.Term,
 			})
 			if err != nil {
-				slog.Error("failed to RequestVote", "error", err)
-				resultCh <- result{granted: false}
+				slog.Error("RequestVote failed", "nodeID", id, "error", err)
+				resultCh <- voteResult{nodeID: id, granted: false}
 				return
 			}
-			resultCh <- result{granted: resp.Granted, term: resp.Term}
-		}()
+			resultCh <- voteResult{nodeID: id, granted: resp.Granted, term: resp.Term}
+		}(id, client)
 	}
 
-	votes := 0
-	for range r.clients {
+	grantedByID := map[string]bool{r.config.ID: true}
+	// NOTE; it will wait for all and won't return true ASAP
+	for range peers {
 		res := <-resultCh
-
-		// if any peer has a higher term, we are stale - abort immediately
 		if res.term > newTerm {
 			if err = r.repository.SetCurrentTerm(ctx, res.term); err != nil {
-				slog.Error("failed to update term after stale election", "error", err)
+				slog.Error("update term after stale election", "error", err)
 			}
 			r.changeRole(raftpb.Role_FOLLOWER)
 			return errors.New("discovered higher term during election")
 		}
-
 		if res.granted {
-			votes++
-			if votes >= neededVotes {
-				return nil
-			}
+			grantedByID[res.nodeID] = true
 		}
 	}
 
-	return errors.New("election failed: not enough votes")
+	hasVote := func(nodeID string) bool { return grantedByID[nodeID] }
+
+	if inJoint {
+		oldWon := r.countQuorum(coldSnapshot, hasVote)
+		newWon := r.countQuorum(cnewSnapshot, hasVote)
+		if !oldWon || !newWon {
+			return fmt.Errorf(
+				"election failed: old quorum=%v new quorum=%v",
+				oldWon, newWon,
+			)
+		}
+	} else {
+		if !r.countQuorum(coldSnapshot, hasVote) {
+			return errors.New("election failed: not enough votes")
+		}
+	}
+
+	return nil
 }
 
-func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) error {
+func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			slog.Error("tryAdvanceCommitIndex", "ERROR", err)
+		}
+	}()
 	currentTerm, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
 		return err
@@ -363,35 +599,42 @@ func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	// +1 because majority means more than half of ALL nodes (including leader)
-	majority := len(r.clients)/2 + 1
+	slog.Debug("tryAdvanceCommitIndex", "lastLogIndex", lastLogIndex, "commitIndex", commitIndex)
 
 	for n := lastLogIndex; n > commitIndex; n-- {
 		entry, err := r.repository.GetEntryAtIndex(ctx, n)
+		slog.Debug("tryAdvanceCommitIndex", "entry at index", entry, "error", err)
 		if err != nil {
 			continue
 		}
+		slog.Debug("tryAdvanceCommitIndex", "term", entry.Term, "currentTerm", currentTerm)
 
 		// Only commit entries from the current term (Raft §5.4.2)
 		if entry.Term != currentTerm {
 			continue
 		}
 
-		// Count how many nodes have this entry
-		replicatedCount := 1 // leader always has it
-		for nodeID := range r.clients {
-			matchIdx, _ := r.repository.GetMatchIndexByNodeID(ctx, nodeID)
-			if matchIdx >= n {
-				replicatedCount++
+		// Build a replicatedOn function that returns true for the leader
+		// (self) and for any peer whose matchIndex >= n.
+		selfID := r.config.ID
+		replicatedOn := func(nodeID string) bool {
+			if nodeID == selfID {
+				return true
 			}
+			matchIdx, _ := r.repository.GetMatchIndexByNodeID(ctx, nodeID)
+			return matchIdx >= n
 		}
 
-		if replicatedCount >= majority {
+		if r.quorumReached(replicatedOn) {
+			slog.Debug("tryAdvanceCommitIndex", "quorumReached", true)
 			if err := r.repository.SetCommitIndex(ctx, n); err != nil {
+				slog.Error("tryAdvanceCommitIndex", "error", err)
 				return err
 			}
 			return r.applyCommitted(ctx)
+		} else {
+
+			slog.Debug("tryAdvanceCommitIndex", "quorumReached", false)
 		}
 	}
 	return nil
@@ -401,6 +644,19 @@ func (r *Raft) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) 
 	currentTerm, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// §6: if we've heard from a leader recently, reject the vote without
+	// updating our term. This prevents removed servers from disrupting
+	// the cluster by forcing leader re-elections.
+	// but this is not fully proved to be right and may cause bugs
+	minElectionTimeout := time.Duration(r.config.ElectionTimeoutEnd) * time.Millisecond
+	slog.Debug("RequestVote", "last heartbeat", time.Since(r.getHeartbeatTime()), "min election timeout", minElectionTimeout)
+	if time.Since(r.getHeartbeatTime()) < minElectionTimeout {
+		return &raftpb.RequestVoteResponse{
+			Term:    currentTerm,
+			Granted: false,
+		}, nil
 	}
 
 	// current term is higher than candidate's term
@@ -494,7 +750,10 @@ func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReque
 
 	prevEntry, err := r.repository.GetEntryAtIndex(ctx, req.PrevLogIndex)
 	if err != nil {
-		return &raftpb.AppendEntriesResponse{Success: false, Term: currentTerm}, nil
+		if errors.Is(err, repository.ErrIndexOutofRange) {
+			return &raftpb.AppendEntriesResponse{Success: false, Term: currentTerm}, nil
+		}
+		return nil, err
 	}
 	if prevEntry.Term != req.PrevLogTerm {
 		return &raftpb.AppendEntriesResponse{Success: false, Term: currentTerm}, nil
@@ -569,6 +828,7 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.S
 	entry := &raftpb.Entry{
 		Term:    term,
 		Command: string(req.Data),
+		Type:    raftpb.EntryType_ENTRY_TYPE_COMMAND,
 	}
 
 	if err := r.repository.TruncateAndAppend(ctx, lastLogIndex, []*raftpb.Entry{entry}); err != nil {
@@ -584,8 +844,82 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.S
 	return &raftpb.SubmitResponse{Success: true}, nil
 }
 
+// ChangeNodes initiates a joint-consensus membership change.
+//
+// Phase 1 (this method):
+//   - Computes C_new from the current C_old plus additions/removals.
+//   - Calls enterJoint to activate joint mode and dial new nodes.
+//   - Appends C_old,new entry and waits for it to commit.
+//
+// Phase 2 (triggered automatically in applyEntry after phase 1 commits):
+//   - Leader appends C_new entry.
+//   - On commit exitJoint promotes C_new → C_old.
+func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest) (*raftpb.ChangeNodesResponse, error) {
+	if r.getRole() != raftpb.Role_LEADER {
+		return &raftpb.ChangeNodesResponse{
+			Success:  false,
+			LeaderId: proto.String(r.getLastKnownLeader()),
+		}, nil
+	}
+
+	r.mu.RLock()
+	inJoint := r.isJoint
+	r.mu.RUnlock()
+
+	if inJoint {
+		return nil, errors.New("membership change already in progress")
+	}
+
+	// Build C_new.
+	r.mu.RLock()
+	cnew := maps.Clone(r.cOld)
+	r.mu.RUnlock()
+
+	for _, id := range req.RemoveIds {
+		delete(cnew, id)
+	}
+	maps.Copy(cnew, req.AddNodes)
+
+	if len(cnew) == 0 {
+		return nil, errors.New("resulting cluster would be empty")
+	}
+
+	// Activate joint mode BEFORE appending the entry so quorum checks
+	// during replication already honour both configs (Raft §6).
+	// if err := r.enterJoint(ctx, cnew); err != nil {
+	// 	return nil, fmt.Errorf("enter joint: %w", err)
+	// }
+
+	term, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lastIdx, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	jointEntry := &raftpb.Entry{
+		Term:   term,
+		Type:   raftpb.EntryType_ENTRY_TYPE_CONFIG_JOINT,
+		Config: &raftpb.ClusterConfig{Nodes: cnew},
+	}
+	if err := r.repository.TruncateAndAppend(ctx, lastIdx, []*raftpb.Entry{jointEntry}); err != nil {
+		return nil, err
+	}
+
+	// Wait for phase-1 to commit.  Phase-2 is triggered automatically by
+	// applyEntry once the joint entry is applied.
+	jointIndex := lastIdx + 1
+	if err := r.waitForCommit(ctx, jointIndex); err != nil {
+		return nil, fmt.Errorf("wait for C_old,new commit: %w", err)
+	}
+
+	return &raftpb.ChangeNodesResponse{Success: true}, nil
+}
+
 func (r *Raft) waitForCommit(ctx context.Context, index uint64) error {
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
 	// timeout so the client doesn't wait forever

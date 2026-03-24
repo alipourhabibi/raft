@@ -2,9 +2,12 @@ package raft
 
 import (
 	"context"
+	"errors"
 
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 )
+
+var ErrIndexOutofRange = errors.New("index out of range")
 
 type RaftRepository interface {
 	GetCurrentTerm(context.Context) (uint64, error)
@@ -32,4 +35,8 @@ type RaftRepository interface {
 	SetLastApplied(ctx context.Context, index uint64) error
 
 	GetNextIndexByNodeID(ctx context.Context, nodeID string) (uint64, error)
+
+	// Cluster
+	GetClusterConfig(ctx context.Context) (*raftpb.ClusterConfig, error)
+	SetClusterConfig(ctx context.Context, config *raftpb.ClusterConfig) error
 }

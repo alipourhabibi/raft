@@ -14,3 +14,7 @@ To run multiple nodes and monitor the logs:
 ./raft-nodes-start.sh
 ```
 And after a moment kill the script and look at the logs on `raft-combined.log.out`
+
+## Problems
+- [ ] the RequestVote does not return asas possible
+- [ ] Check for the order of the heartbeat and etc in methods

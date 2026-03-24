@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,8 +11,8 @@ import (
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
 	"github.com/alipourhabibi/raft/internal/infrastructure/redis"
+	"github.com/alipourhabibi/raft/internal/repository/raft"
 	goredis "github.com/redis/go-redis/v9"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -20,6 +21,7 @@ const (
 	LOGS_KEY         = "logs"
 	NEXT_INDEX_KEY   = "next_index"
 	MATCH_INDEX_KEY  = "match_index"
+	CLUSTER_CONFIG   = "cluster_config"
 )
 
 func NewRedisDB(ctx context.Context, cfg *config.Config, infra *redis.RedisInfra) (*RedisDB, error) {
@@ -31,7 +33,7 @@ func NewRedisDB(ctx context.Context, cfg *config.Config, infra *redis.RedisInfra
 	}
 	if exists == 0 {
 		sentinel := &raftpb.Entry{Term: 0}
-		raw, err := proto.Marshal(sentinel)
+		raw, err := json.Marshal(sentinel)
 		if err != nil {
 			return nil, fmt.Errorf("marshal sentinel: %w", err)
 		}
@@ -62,12 +64,12 @@ type RedisDB struct {
 }
 
 func marshalEntry(e *raftpb.Entry) ([]byte, error) {
-	return proto.Marshal(e)
+	return json.Marshal(e)
 }
 
 func unmarshalEntry(raw []byte) (*raftpb.Entry, error) {
 	e := &raftpb.Entry{}
-	return e, proto.Unmarshal(raw, e)
+	return e, json.Unmarshal(raw, e)
 }
 
 func (r *RedisDB) GetCurrentTerm(ctx context.Context) (uint64, error) {
@@ -151,7 +153,7 @@ func (r *RedisDB) GetEntryAtIndex(ctx context.Context, index uint64) (*raftpb.En
 	raw, err := r.redis.Client.LIndex(ctx, LOGS_KEY, int64(index)).Bytes()
 	if err != nil {
 		if errors.Is(err, goredis.Nil) {
-			return nil, errors.New("index out of range")
+			return nil, raft.ErrIndexOutofRange
 		}
 		return nil, err
 	}
@@ -239,4 +241,28 @@ func (r *RedisDB) GetMatchIndexByNodeID(ctx context.Context, nodeID string) (uin
 
 func (r *RedisDB) SetMatchIndex(ctx context.Context, nodeID string, index uint64) error {
 	return r.redis.Client.HSet(ctx, MATCH_INDEX_KEY, nodeID, index).Err()
+}
+
+func (r *RedisDB) GetClusterConfig(ctx context.Context) (*raftpb.ClusterConfig, error) {
+	val, err := r.redis.Client.Get(ctx, CLUSTER_CONFIG).Result()
+	if err != nil {
+		if errors.Is(err, goredis.Nil) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	conf := &raftpb.ClusterConfig{}
+	if err := json.Unmarshal([]byte(val), conf); err != nil {
+		return nil, err
+	}
+	return conf, nil
+}
+
+func (r *RedisDB) SetClusterConfig(ctx context.Context, config *raftpb.ClusterConfig) error {
+
+	conf, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	return r.redis.Client.Set(ctx, CLUSTER_CONFIG, conf, 0).Err()
 }

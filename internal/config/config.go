@@ -14,6 +14,7 @@ type Config struct {
 	ElectionTimeoutEnd   uint64 `env:"ELECTION_TIMEOUT_END"`
 
 	ID    string            `env:"ID"`
+	Host  string            `env:"HOST"`
 	Nodes map[string]string `env:"NODES"` // nodeID: url
 
 	HeartbeatTimeout uint64 `env:"HEARTBEAT_TIMEOUT"`
