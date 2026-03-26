@@ -21,8 +21,9 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	RaftService_RequestVote_FullMethodName   = "/raft.v1.RaftService/RequestVote"
 	RaftService_AppendEntries_FullMethodName = "/raft.v1.RaftService/AppendEntries"
-	RaftService_Submit_FullMethodName        = "/raft.v1.RaftService/Submit"
 	RaftService_ChangeNodes_FullMethodName   = "/raft.v1.RaftService/ChangeNodes"
+	RaftService_Submit_FullMethodName        = "/raft.v1.RaftService/Submit"
+	RaftService_Get_FullMethodName           = "/raft.v1.RaftService/Get"
 )
 
 // RaftServiceClient is the client API for RaftService service.
@@ -31,8 +32,11 @@ const (
 type RaftServiceClient interface {
 	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
 	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
-	Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (*SubmitResponse, error)
 	ChangeNodes(ctx context.Context, in *ChangeNodesRequest, opts ...grpc.CallOption) (*ChangeNodesResponse, error)
+	// Is used for write operations
+	Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (*SubmitResponse, error)
+	// Is used for read operations
+	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 }
 
 type raftServiceClient struct {
@@ -63,6 +67,16 @@ func (c *raftServiceClient) AppendEntries(ctx context.Context, in *AppendEntries
 	return out, nil
 }
 
+func (c *raftServiceClient) ChangeNodes(ctx context.Context, in *ChangeNodesRequest, opts ...grpc.CallOption) (*ChangeNodesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ChangeNodesResponse)
+	err := c.cc.Invoke(ctx, RaftService_ChangeNodes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *raftServiceClient) Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (*SubmitResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SubmitResponse)
@@ -73,10 +87,10 @@ func (c *raftServiceClient) Submit(ctx context.Context, in *SubmitRequest, opts 
 	return out, nil
 }
 
-func (c *raftServiceClient) ChangeNodes(ctx context.Context, in *ChangeNodesRequest, opts ...grpc.CallOption) (*ChangeNodesResponse, error) {
+func (c *raftServiceClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ChangeNodesResponse)
-	err := c.cc.Invoke(ctx, RaftService_ChangeNodes_FullMethodName, in, out, cOpts...)
+	out := new(GetResponse)
+	err := c.cc.Invoke(ctx, RaftService_Get_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -89,8 +103,11 @@ func (c *raftServiceClient) ChangeNodes(ctx context.Context, in *ChangeNodesRequ
 type RaftServiceServer interface {
 	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
-	Submit(context.Context, *SubmitRequest) (*SubmitResponse, error)
 	ChangeNodes(context.Context, *ChangeNodesRequest) (*ChangeNodesResponse, error)
+	// Is used for write operations
+	Submit(context.Context, *SubmitRequest) (*SubmitResponse, error)
+	// Is used for read operations
+	Get(context.Context, *GetRequest) (*GetResponse, error)
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
@@ -107,11 +124,14 @@ func (UnimplementedRaftServiceServer) RequestVote(context.Context, *RequestVoteR
 func (UnimplementedRaftServiceServer) AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AppendEntries not implemented")
 }
+func (UnimplementedRaftServiceServer) ChangeNodes(context.Context, *ChangeNodesRequest) (*ChangeNodesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ChangeNodes not implemented")
+}
 func (UnimplementedRaftServiceServer) Submit(context.Context, *SubmitRequest) (*SubmitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Submit not implemented")
 }
-func (UnimplementedRaftServiceServer) ChangeNodes(context.Context, *ChangeNodesRequest) (*ChangeNodesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ChangeNodes not implemented")
+func (UnimplementedRaftServiceServer) Get(context.Context, *GetRequest) (*GetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
 }
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
 func (UnimplementedRaftServiceServer) testEmbeddedByValue()                     {}
@@ -170,6 +190,24 @@ func _RaftService_AppendEntries_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftService_ChangeNodes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ChangeNodesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServiceServer).ChangeNodes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftService_ChangeNodes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServiceServer).ChangeNodes(ctx, req.(*ChangeNodesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _RaftService_Submit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SubmitRequest)
 	if err := dec(in); err != nil {
@@ -188,20 +226,20 @@ func _RaftService_Submit_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
-func _RaftService_ChangeNodes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ChangeNodesRequest)
+func _RaftService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(RaftServiceServer).ChangeNodes(ctx, in)
+		return srv.(RaftServiceServer).Get(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: RaftService_ChangeNodes_FullMethodName,
+		FullMethod: RaftService_Get_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftServiceServer).ChangeNodes(ctx, req.(*ChangeNodesRequest))
+		return srv.(RaftServiceServer).Get(ctx, req.(*GetRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -222,12 +260,16 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RaftService_AppendEntries_Handler,
 		},
 		{
+			MethodName: "ChangeNodes",
+			Handler:    _RaftService_ChangeNodes_Handler,
+		},
+		{
 			MethodName: "Submit",
 			Handler:    _RaftService_Submit_Handler,
 		},
 		{
-			MethodName: "ChangeNodes",
-			Handler:    _RaftService_ChangeNodes_Handler,
+			MethodName: "Get",
+			Handler:    _RaftService_Get_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

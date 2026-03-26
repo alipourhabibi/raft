@@ -12,6 +12,7 @@ import (
 
 type StateMachine interface {
 	Apply(ctx context.Context, entry *raft.Entry) error
+	Get(ctx context.Context, command string) (string, error)
 }
 
 type stateMachine struct {
@@ -39,4 +40,16 @@ func (s *stateMachine) Apply(ctx context.Context, entry *raft.Entry) error {
 		return s.repository.Set(ctx, command[1], command[2])
 	}
 	return nil
+}
+
+func (s *stateMachine) Get(ctx context.Context, cmd string) (string, error) {
+	command := strings.Split(cmd, " ")
+	switch strings.ToLower(command[0]) {
+	case "get":
+		if len(command) < 2 {
+			return "", errors.New("invalid command")
+		}
+		return s.repository.Get(ctx, command[1])
+	}
+	return "", nil
 }

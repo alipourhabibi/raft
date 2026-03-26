@@ -55,7 +55,8 @@ message AppendEntriesResponse {
 }
 
 message SubmitRequest {
-  string data = 1;
+  string command = 1;
+  string serial_number = 2;
 }
 
 message SubmitResponse {
@@ -74,9 +75,23 @@ message ChangeNodesResponse {
   optional string leader_id = 2;
 }
 
+message GetRequest {
+  string command = 1;
+}
+
+message GetResponse {
+  string value = 1;
+  string leader_id = 2;
+  bool status = 3;
+}
+
 service RaftService {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
-  rpc Submit(SubmitRequest) returns (SubmitResponse);
   rpc ChangeNodes(ChangeNodesRequest) returns (ChangeNodesResponse);
+
+  // Is used for write operations
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  // Is used for read operations
+  rpc Get(GetRequest) returns (GetResponse);
 }

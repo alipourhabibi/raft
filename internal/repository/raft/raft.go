@@ -39,4 +39,7 @@ type RaftRepository interface {
 	// Cluster
 	GetClusterConfig(ctx context.Context) (*raftpb.ClusterConfig, error)
 	SetClusterConfig(ctx context.Context, config *raftpb.ClusterConfig) error
+
+	SetSerialNumber(ctx context.Context, serialNumber string, status bool) error
+	GetSerialNumber(ctx context.Context, serialNumber string) (bool, error)
 }

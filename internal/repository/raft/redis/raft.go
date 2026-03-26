@@ -22,6 +22,7 @@ const (
 	NEXT_INDEX_KEY   = "next_index"
 	MATCH_INDEX_KEY  = "match_index"
 	CLUSTER_CONFIG   = "cluster_config"
+	SERIAL_NUMBER    = "serial_number"
 )
 
 func NewRedisDB(ctx context.Context, cfg *config.Config, infra *redis.RedisInfra) (*RedisDB, error) {
@@ -259,10 +260,21 @@ func (r *RedisDB) GetClusterConfig(ctx context.Context) (*raftpb.ClusterConfig, 
 }
 
 func (r *RedisDB) SetClusterConfig(ctx context.Context, config *raftpb.ClusterConfig) error {
-
 	conf, err := json.Marshal(config)
 	if err != nil {
 		return err
 	}
 	return r.redis.Client.Set(ctx, CLUSTER_CONFIG, conf, 0).Err()
+}
+
+func (r *RedisDB) SetSerialNumber(ctx context.Context, serialNumber string, status bool) error {
+	return r.redis.Client.HSet(ctx, SERIAL_NUMBER, serialNumber, status).Err()
+}
+
+func (r *RedisDB) GetSerialNumber(ctx context.Context, serialNumber string) (bool, error) {
+	status, err := r.redis.Client.HGet(ctx, SERIAL_NUMBER, serialNumber).Bool()
+	if err != nil && !errors.Is(err, goredis.Nil) {
+		return false, err
+	}
+	return status, nil
 }

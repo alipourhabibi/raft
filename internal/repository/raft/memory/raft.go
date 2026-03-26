@@ -36,6 +36,8 @@ func NewMemoryDB(config *config.Config) *MemoryDB {
 		matchIndex: matchIndex,
 
 		clusterConfig: clusterConfig,
+
+		serialNumbers: map[string]bool{},
 	}
 }
 
@@ -57,6 +59,8 @@ type MemoryDB struct {
 
 	// Cluster
 	clusterConfig *raftpb.ClusterConfig
+
+	serialNumbers map[string]bool
 }
 
 func (m *MemoryDB) GetCurrentTerm(context.Context) (uint64, error) {
@@ -213,4 +217,17 @@ func (m *MemoryDB) SetClusterConfig(ctx context.Context, config *raftpb.ClusterC
 
 	m.clusterConfig = config
 	return nil
+}
+
+func (m *MemoryDB) SetSerialNumber(ctx context.Context, serialNumber string, status bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.serialNumbers[serialNumber] = status
+	return nil
+}
+
+func (m *MemoryDB) GetSerialNumber(ctx context.Context, serialNumber string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.serialNumbers[serialNumber], nil
 }

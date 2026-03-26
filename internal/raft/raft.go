@@ -15,7 +15,9 @@ import (
 	repository "github.com/alipourhabibi/raft/internal/repository/raft"
 	"github.com/alipourhabibi/raft/internal/statemachine"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -272,8 +274,19 @@ func (r *Raft) Serve(ctx context.Context) error {
 					if err := r.repository.InitLeaderState(ctx); err != nil {
 						slog.Error("failed to init leader state", "error", err)
 						r.changeRole(raftpb.Role_FOLLOWER)
+						continue
 					}
-					slog.Debug("start election succeeded", "role", r.role)
+					slog.Debug("start election succeeded; adding a no-op entry", "role", r.role)
+					// NOTE; i send it in goroutine so it won't block the send heartbeat as leader
+					go func() {
+						if err := r.commitNoOpEntry(ctx); err != nil {
+							slog.Error("failed to commit no-op entry after election", "error", err)
+							if r.getRole() == raftpb.Role_LEADER {
+								r.changeRole(raftpb.Role_FOLLOWER)
+							}
+						}
+					}()
+
 				}
 			case <-r.heartbeatCh:
 				slog.Debug("heartbeat received", "role", r.role)
@@ -304,6 +317,39 @@ func (r *Raft) Serve(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (r *Raft) commitNoOpEntry(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	term, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return err
+	}
+
+	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		return err
+	}
+
+	entry := &raftpb.Entry{
+		Term:    term,
+		Command: string("NO OP"),
+		Type:    raftpb.EntryType_ENTRY_TYPE_COMMAND,
+	}
+
+	if err := r.repository.TruncateAndAppend(ctx, lastLogIndex, []*raftpb.Entry{entry}); err != nil {
+		return err
+	}
+
+	entryIndex := lastLogIndex + 1
+	if err := r.waitForCommit(ctx, entryIndex); err != nil {
+		return err
+	}
+
+	slog.Debug("Submit succeeded", "term", term, "entryIndex", entryIndex)
+	return nil
 }
 
 func (r *Raft) applyEntry(ctx context.Context, entry *raftpb.Entry) error {
@@ -484,38 +530,30 @@ func (r *Raft) sendHeartbeat() error {
 func (r *Raft) startElection() error {
 	ctx := context.Background()
 
-	// 1. Increment current term
 	newTerm, err := r.repository.IncCurrentTerm(ctx)
 	if err != nil {
 		return err
 	}
-
-	// 2. Vote for itself
 	err = r.repository.VoteFor(ctx, newTerm, r.config.ID)
 	if err != nil {
 		return err
 	}
-
-	// 3. Reset election timer
 	select {
 	case r.heartbeatCh <- struct{}{}:
 	default:
 	}
-
 	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
 	if err != nil {
 		return err
 	}
-
 	lastLogEntry, err := r.repository.GetEntryAtIndex(ctx, lastLogIndex)
 	if err != nil {
 		return err
 	}
-
 	r.mu.RLock()
-	peers := maps.Clone(r.clients) // union of cOld ∪ cNew already
+	peers := maps.Clone(r.clients)
 	coldSnapshot := maps.Clone(r.cOld)
-	cnewSnapshot := maps.Clone(r.cNew) // nil when not in joint
+	cnewSnapshot := maps.Clone(r.cNew)
 	inJoint := r.isJoint
 	r.mu.RUnlock()
 
@@ -525,7 +563,6 @@ func (r *Raft) startElection() error {
 		term    uint64
 	}
 	resultCh := make(chan voteResult, len(peers))
-
 	for id, client := range peers {
 		go func(id string, client raftpb.RaftServiceClient) {
 			ctx2, cancel := context.WithTimeout(ctx, 1000*time.Millisecond)
@@ -546,9 +583,11 @@ func (r *Raft) startElection() error {
 	}
 
 	grantedByID := map[string]bool{r.config.ID: true}
-	// NOTE; it will wait for all and won't return true ASAP
+	hasVote := func(nodeID string) bool { return grantedByID[nodeID] }
+
 	for range peers {
 		res := <-resultCh
+
 		if res.term > newTerm {
 			if err = r.repository.SetCurrentTerm(ctx, res.term); err != nil {
 				slog.Error("update term after stale election", "error", err)
@@ -556,29 +595,30 @@ func (r *Raft) startElection() error {
 			r.changeRole(raftpb.Role_FOLLOWER)
 			return errors.New("discovered higher term during election")
 		}
+
 		if res.granted {
 			grantedByID[res.nodeID] = true
 		}
+
+		// Check quorum after every vote - return as soon as we win.
+		if inJoint {
+			if r.countQuorum(coldSnapshot, hasVote) && r.countQuorum(cnewSnapshot, hasVote) {
+				return nil
+			}
+		} else {
+			if r.countQuorum(coldSnapshot, hasVote) {
+				return nil
+			}
+		}
 	}
 
-	hasVote := func(nodeID string) bool { return grantedByID[nodeID] }
-
+	// Exhausted all responses without reaching quorum.
 	if inJoint {
 		oldWon := r.countQuorum(coldSnapshot, hasVote)
 		newWon := r.countQuorum(cnewSnapshot, hasVote)
-		if !oldWon || !newWon {
-			return fmt.Errorf(
-				"election failed: old quorum=%v new quorum=%v",
-				oldWon, newWon,
-			)
-		}
-	} else {
-		if !r.countQuorum(coldSnapshot, hasVote) {
-			return errors.New("election failed: not enough votes")
-		}
+		return fmt.Errorf("election failed: old quorum=%v new quorum=%v", oldWon, newWon)
 	}
-
-	return nil
+	return errors.New("election failed: not enough votes")
 }
 
 func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) (err error) {
@@ -807,11 +847,25 @@ func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReque
 }
 
 func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.SubmitResponse, error) {
+
+	if req.Command == "" || req.SerialNumber == "" {
+		return nil, status.Error(codes.InvalidArgument, "Command/SerialNumber not provided")
+	}
+
 	role := r.getRole()
 	if role != raftpb.Role_LEADER {
 		return &raftpb.SubmitResponse{
 			Success:  false,
 			LeaderId: r.getLastKnownLeader(),
+		}, nil
+	}
+
+	if success, err := r.repository.GetSerialNumber(ctx, req.SerialNumber); err != nil {
+		return nil, err
+	} else if success {
+		return &raftpb.SubmitResponse{
+			LeaderId: r.config.ID,
+			Success:  success,
 		}, nil
 	}
 
@@ -827,7 +881,7 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.S
 
 	entry := &raftpb.Entry{
 		Term:    term,
-		Command: string(req.Data),
+		Command: string(req.Command),
 		Type:    raftpb.EntryType_ENTRY_TYPE_COMMAND,
 	}
 
@@ -840,8 +894,40 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.S
 		return nil, err
 	}
 
+	if err := r.repository.SetSerialNumber(ctx, req.SerialNumber, true); err != nil {
+		return nil, err
+	}
+
 	slog.Debug("Submit succeeded", "term", term, "entryIndex", entryIndex)
 	return &raftpb.SubmitResponse{Success: true}, nil
+}
+
+func (r *Raft) Get(ctx context.Context, req *raftpb.GetRequest) (*raftpb.GetResponse, error) {
+	if req.Command == "" {
+		return nil, status.Error(codes.InvalidArgument, "Command not provided")
+	}
+
+	role := r.getRole()
+	if role != raftpb.Role_LEADER {
+		return &raftpb.GetResponse{
+			Status:   false,
+			LeaderId: r.getLastKnownLeader(),
+		}, nil
+	}
+
+	if err := r.sendHeartbeat(); err != nil {
+		return nil, err
+	}
+
+	data, err := r.stateMachine.Get(ctx, req.Command)
+	if err != nil {
+		return nil, err
+	}
+
+	return &raftpb.GetResponse{
+		Status: true,
+		Value:  data,
+	}, nil
 }
 
 // ChangeNodes initiates a joint-consensus membership change.
