@@ -125,6 +125,7 @@ func (r *Raft) countQuorum(members map[string]string, has func(nodeID string) bo
 	return got >= need
 }
 
+// gets the clients in lock-safe manner
 func (r *Raft) peerSnapshot() map[string]raftpb.RaftServiceClient {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -198,6 +199,7 @@ func (r *Raft) exitJoint(_ context.Context) error {
 	return nil
 }
 
+// this is used by the deleted node so it won't request for vote from other nodes
 func (r *Raft) stepDown() {
 	r.role = raftpb.Role_FOLLOWER
 	// NOTE this is not right and i just added it due to the problem for the raft membership change so i can test
@@ -206,12 +208,14 @@ func (r *Raft) stepDown() {
 	slog.Info("removed self from cluster, stepping down")
 }
 
+// adds the new heartbeat time in lock-free manner
 func (r *Raft) setHeartbeatTime() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.lastHeartbeat = time.Now()
 }
 
+// gets the heartbeat time in lock-free manner
 func (r *Raft) getHeartbeatTime() time.Time {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -319,6 +323,7 @@ func (r *Raft) Serve(ctx context.Context) error {
 	}
 }
 
+// commitNoOpEntry used by leader to send a no-op entry so it knows the latest committed entry
 func (r *Raft) commitNoOpEntry(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -352,6 +357,8 @@ func (r *Raft) commitNoOpEntry(ctx context.Context) error {
 	return nil
 }
 
+// applyEntry is used to apply entry to the system.
+// the default behavior is applying to state machine and others are used for membership changes
 func (r *Raft) applyEntry(ctx context.Context, entry *raftpb.Entry) error {
 	slog.Debug("applying entry", "term", entry.Term, "data", entry)
 
@@ -414,6 +421,7 @@ func (r *Raft) appendFinalConfig(ctx context.Context) error {
 	return r.repository.TruncateAndAppend(ctx, lastIdx, []*raftpb.Entry{entry})
 }
 
+// applyCommitted is used to apply the entry to state machine from committed but not applied entry
 func (r *Raft) applyCommitted(ctx context.Context) error {
 	lastApplied, err := r.repository.GetLastAppliedIndex(ctx)
 	if err != nil {
@@ -439,6 +447,8 @@ func (r *Raft) applyCommitted(ctx context.Context) error {
 	return nil
 }
 
+// sendHeartbeat is used by admin to send the heartbeat
+// it is also sends entries if there are any non-sent ones
 func (r *Raft) sendHeartbeat() error {
 	ctx := context.Background()
 	term, err := r.repository.GetCurrentTerm(ctx)
@@ -621,12 +631,19 @@ func (r *Raft) startElection() error {
 	return errors.New("election failed: not enough votes")
 }
 
+// tryAdvanceCommitIndex scans the log backwards from the last entry to find
+// the highest index n that is safe to commit, then updates the commit index
+// and applies all newly committed entries to the state machine.
+//
+// An entry at index n is committable when:
+//   - Its term matches the current term (Raft §5.4.2 - a leader may only
+//     directly commit entries from its own term; older entries are committed
+//     transitively).
+//   - A quorum of nodes has replicated it (matchIndex >= n).
+//
+// Scanning backwards ensures we commit as high as possible in one pass;
+// committing n implicitly commits everything below it.
 func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) (err error) {
-	defer func() {
-		if err != nil {
-			slog.Error("tryAdvanceCommitIndex", "ERROR", err)
-		}
-	}()
 	currentTerm, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
 		return err
@@ -639,15 +656,12 @@ func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	slog.Debug("tryAdvanceCommitIndex", "lastLogIndex", lastLogIndex, "commitIndex", commitIndex)
 
 	for n := lastLogIndex; n > commitIndex; n-- {
 		entry, err := r.repository.GetEntryAtIndex(ctx, n)
-		slog.Debug("tryAdvanceCommitIndex", "entry at index", entry, "error", err)
 		if err != nil {
 			continue
 		}
-		slog.Debug("tryAdvanceCommitIndex", "term", entry.Term, "currentTerm", currentTerm)
 
 		// Only commit entries from the current term (Raft §5.4.2)
 		if entry.Term != currentTerm {
@@ -666,20 +680,17 @@ func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) (err error) {
 		}
 
 		if r.quorumReached(replicatedOn) {
-			slog.Debug("tryAdvanceCommitIndex", "quorumReached", true)
 			if err := r.repository.SetCommitIndex(ctx, n); err != nil {
-				slog.Error("tryAdvanceCommitIndex", "error", err)
+				slog.Error("SetCommitIndex", "error", err)
 				return err
 			}
 			return r.applyCommitted(ctx)
-		} else {
-
-			slog.Debug("tryAdvanceCommitIndex", "quorumReached", false)
 		}
 	}
 	return nil
 }
 
+// RequestVote handles the call from candidate
 func (r *Raft) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
 	currentTerm, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
@@ -762,6 +773,7 @@ func (r *Raft) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) 
 	}, nil
 }
 
+// AppendEntries handles the call from leader that sends the log entries
 func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
 
 	currentTerm, err := r.repository.GetCurrentTerm(ctx)
@@ -846,6 +858,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReque
 	}, nil
 }
 
+// Submit is used to set a command to the state machine
 func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.SubmitResponse, error) {
 
 	if req.Command == "" || req.SerialNumber == "" {
@@ -902,6 +915,7 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.S
 	return &raftpb.SubmitResponse{Success: true}, nil
 }
 
+// Get is used to do a read operation on the state machine
 func (r *Raft) Get(ctx context.Context, req *raftpb.GetRequest) (*raftpb.GetResponse, error) {
 	if req.Command == "" {
 		return nil, status.Error(codes.InvalidArgument, "Command not provided")
@@ -972,9 +986,9 @@ func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest) 
 
 	// Activate joint mode BEFORE appending the entry so quorum checks
 	// during replication already honour both configs (Raft §6).
-	// if err := r.enterJoint(ctx, cnew); err != nil {
-	// 	return nil, fmt.Errorf("enter joint: %w", err)
-	// }
+	if err := r.enterJoint(ctx, cnew); err != nil {
+		return nil, fmt.Errorf("enter joint: %w", err)
+	}
 
 	term, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
