@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"math/rand/v2"
 	"slices"
 	"sync"
 	"time"
@@ -30,6 +29,11 @@ type Message interface {
 type Transport interface {
 	Send(ctx context.Context, to NodeID, msg Message)
 	AddPeer(id NodeID, addr string) error
+}
+
+// Rand is the random source for election timeouts.
+type Rand interface {
+	Uint64N(n uint64) uint64
 }
 
 type RequestVoteRequest struct {
@@ -120,7 +124,7 @@ type Raft struct {
 	lastHeartbeat uint64
 
 	transport Transport
-	rng       *rand.Rand
+	rng       Rand
 	inbox     chan envelope
 
 	// logical time (ms)
@@ -159,7 +163,7 @@ func NewRaftService(
 	config *config.Config,
 	stateMachine statemachine.StateMachine,
 	transport Transport,
-	rng *rand.Rand,
+	rng Rand,
 ) (*Raft, error) {
 	ctx := context.Background()
 
