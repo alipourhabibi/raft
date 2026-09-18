@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,31 +15,139 @@ import (
 	"github.com/alipourhabibi/raft/internal/config"
 	repository "github.com/alipourhabibi/raft/internal/repository/raft"
 	"github.com/alipourhabibi/raft/internal/statemachine"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
-type Raft struct {
-	raftpb.UnimplementedRaftServiceServer
+type NodeID string
 
+type Message interface {
+	isRaftMessage()
+}
+
+// Transport sends messages. It never waits for a reply.
+type Transport interface {
+	Send(ctx context.Context, to NodeID, msg Message)
+	AddPeer(id NodeID, addr string) error
+}
+
+type RequestVoteRequest struct {
+	Term         uint64
+	CandidateID  NodeID
+	LastLogIndex uint64
+	LastLogTerm  uint64
+}
+
+func (RequestVoteRequest) isRaftMessage() {}
+
+type RequestVoteResponse struct {
+	Term    uint64
+	Granted bool
+}
+
+func (RequestVoteResponse) isRaftMessage() {}
+
+type AppendEntriesRequest struct {
+	Term         uint64
+	LeaderID     NodeID
+	PrevLogIndex uint64
+	PrevLogTerm  uint64
+	Entries      []*raftpb.Entry
+	LeaderCommit uint64
+	Seq          uint64
+}
+
+func (AppendEntriesRequest) isRaftMessage() {}
+
+type AppendEntriesResponse struct {
+	Term    uint64
+	Success bool
+	Seq     uint64
+}
+
+func (AppendEntriesResponse) isRaftMessage() {}
+
+// Client Request
+
+type SubmitRequest struct {
+	Req   *raftpb.SubmitRequest
+	Reply func(*raftpb.SubmitResponse, error)
+}
+
+func (SubmitRequest) isRaftMessage() {}
+
+type GetRequest struct {
+	Req   *raftpb.GetRequest
+	Reply func(*raftpb.GetResponse, error)
+}
+
+func (GetRequest) isRaftMessage() {}
+
+type ChangeNodesRequest struct {
+	Req   *raftpb.ChangeNodesRequest
+	Reply func(*raftpb.ChangeNodesResponse, error)
+}
+
+func (ChangeNodesRequest) isRaftMessage() {}
+
+type envelope struct {
+	from NodeID
+	msg  Message
+}
+
+type commitWaiter struct {
+	index    uint64
+	deadline uint64 // logical ms
+	done     func(error)
+}
+
+type sentAppend struct {
+	seq          uint64
+	prevLogIndex uint64
+	matchIndex   uint64
+}
+
+type Raft struct {
 	mu           sync.RWMutex
 	repository   repository.RaftRepository
 	role         raftpb.Role
 	config       *config.Config
 	stateMachine statemachine.StateMachine
 
-	heartbeatCh chan struct{}
-
 	lastKnownLeader string
-	lastHeartbeat   time.Time
+
+	lastHeartbeat uint64
+
+	transport Transport
+	rng       *rand.Rand
+	inbox     chan envelope
+
+	// logical time (ms)
+	now               uint64
+	electionDeadline  uint64
+	heartbeatDeadline uint64
+
+	// Owned by the single event goroutine, no lock.
+	commitIndex uint64
+	lastApplied uint64
+	nextIndex   map[string]uint64
+	matchIndex  map[string]uint64
+	lastSent    map[string]sentAppend
+	appendSeq   uint64
+
+	electionTerm  uint64
+	votes         map[string]bool
+	electionCOld  map[string]string
+	electionCNew  map[string]string
+	electionJoint bool
+
+	waiters []commitWaiter
 
 	// nodes
 	isJoint bool
-	// clients gRPC stubs - always the union of cOld ∪ cNew (minus self)
-	clients map[string]raftpb.RaftServiceClient
+	// always the union of cOld ∪ cNew (minus self). nodeID: url
+	clients map[string]string
 	// stable config
 	cOld map[string]string
 	// only in isJoint and nil otherwise
@@ -49,6 +158,8 @@ func NewRaftService(
 	repository repository.RaftRepository,
 	config *config.Config,
 	stateMachine statemachine.StateMachine,
+	transport Transport,
+	rng *rand.Rand,
 ) (*Raft, error) {
 	ctx := context.Background()
 
@@ -75,31 +186,520 @@ func NewRaftService(
 		}
 	}
 
-	clients := map[string]raftpb.RaftServiceClient{}
-
+	clients := map[string]string{}
 	for k, v := range cold {
 		if k == config.ID {
 			continue
 		}
-		conn, err := grpc.NewClient(
-			v,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		)
-		if err != nil {
+		if err := transport.AddPeer(NodeID(k), v); err != nil {
 			return nil, err
 		}
-		clients[k] = raftpb.NewRaftServiceClient(conn)
+		clients[k] = v
 	}
-	return &Raft{
-		config:        config,
-		repository:    repository,
-		role:          raftpb.Role_FOLLOWER,
-		heartbeatCh:   make(chan struct{}),
-		clients:       clients,
-		stateMachine:  stateMachine,
-		cOld:          cold,
-		lastHeartbeat: time.Now(),
-	}, nil
+
+	nextIndex := map[string]uint64{}
+	matchIndex := map[string]uint64{}
+	for nodeID := range config.Nodes {
+		nextIndex[nodeID] = 1
+		matchIndex[nodeID] = 0
+	}
+
+	r := &Raft{
+		config:       config,
+		repository:   repository,
+		role:         raftpb.Role_FOLLOWER,
+		clients:      clients,
+		stateMachine: stateMachine,
+		cOld:         cold,
+		transport:    transport,
+		rng:          rng,
+		inbox:        make(chan envelope, 1024),
+		nextIndex:    nextIndex,
+		matchIndex:   matchIndex,
+		lastSent:     map[string]sentAppend{},
+	}
+	r.resetElectionDeadline()
+	return r, nil
+}
+
+// Serve is the production driver.
+func (r *Raft) Serve(ctx context.Context) error {
+	ticker := time.NewTicker(time.Duration(r.config.TickInterval) * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case env := <-r.inbox:
+			r.Step(ctx, env.from, env.msg)
+		case <-ticker.C:
+			r.Tick(ctx)
+		}
+	}
+}
+
+// Deliver is used by the gRPC server. It only queues the message.
+func (r *Raft) Deliver(ctx context.Context, from NodeID, msg Message) error {
+	select {
+	case r.inbox <- envelope{from: from, msg: msg}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Step handles one message.
+func (r *Raft) Step(ctx context.Context, from NodeID, msg Message) {
+	var err error
+	switch m := msg.(type) {
+	case RequestVoteRequest:
+		err = r.RequestVote(ctx, from, m)
+	case RequestVoteResponse:
+		err = r.handleRequestVoteResponse(ctx, from, m)
+	case AppendEntriesRequest:
+		err = r.AppendEntries(ctx, from, m)
+	case AppendEntriesResponse:
+		err = r.handleAppendEntriesResponse(ctx, from, m)
+	case SubmitRequest:
+		r.Submit(ctx, m.Req, m.Reply)
+	case GetRequest:
+		m.Reply(r.Get(ctx, m.Req))
+	case ChangeNodesRequest:
+		r.ChangeNodes(ctx, m.Req, m.Reply)
+	default:
+		slog.Error("unknown message", "type", fmt.Sprintf("%T", msg))
+	}
+	if err != nil {
+		slog.Error("step failed", "from", from, "type", fmt.Sprintf("%T", msg), "error", err)
+	}
+}
+
+// Tick moves logical time
+func (r *Raft) Tick(ctx context.Context) {
+	r.now += r.config.TickInterval
+	r.checkWaiters()
+
+	role := r.getRole()
+	switch role {
+	case raftpb.Role_FOLLOWER, raftpb.Role_CANDIDATE:
+		if r.now < r.electionDeadline {
+			return
+		}
+		slog.Debug("ticker ticked", "role", role)
+		r.resetElectionDeadline()
+		r.changeRole(raftpb.Role_CANDIDATE)
+		if err := r.startElection(ctx); err != nil {
+			slog.Error("failed to start election", "error", err)
+		}
+
+	case raftpb.Role_LEADER:
+		if r.now < r.heartbeatDeadline {
+			return
+		}
+		slog.Debug("ticker ticked", "role", role)
+		err := r.sendHeartbeat(ctx)
+		if err != nil {
+			slog.Error("failed to send heartbeat", "error", err)
+		}
+		r.setHeartbeatTime()
+		r.heartbeatDeadline = r.now + r.config.HeartbeatTimeout
+	}
+}
+
+func (r *Raft) resetElectionDeadline() {
+	timeoutMs := r.rng.Uint64N(r.config.ElectionTimeoutEnd-r.config.ElectionTimeoutStart) + r.config.ElectionTimeoutStart
+	r.electionDeadline = r.now + timeoutMs
+}
+
+func (r *Raft) onHeartbeat() {
+	r.setHeartbeatTime()
+	r.changeRole(raftpb.Role_FOLLOWER)
+	r.resetElectionDeadline()
+}
+
+func (r *Raft) becomeLeader(ctx context.Context) {
+	r.changeRole(raftpb.Role_LEADER)
+	if err := r.initLeaderState(ctx); err != nil {
+		slog.Error("failed to init leader state", "error", err)
+		r.changeRole(raftpb.Role_FOLLOWER)
+		r.resetElectionDeadline()
+		return
+	}
+	r.heartbeatDeadline = r.now + r.config.HeartbeatTimeout
+
+	slog.Debug("start election succeeded; adding a no-op entry", "role", r.role)
+	r.commitNoOpEntry(ctx, func(err error) {
+		if err != nil {
+			slog.Error("failed to commit no-op entry after election", "error", err)
+			if r.getRole() == raftpb.Role_LEADER {
+				r.changeRole(raftpb.Role_FOLLOWER)
+				r.resetElectionDeadline()
+			}
+		}
+	})
+}
+
+func (r *Raft) initLeaderState(ctx context.Context) error {
+	lastIndex, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		return err
+	}
+	for nodeID := range r.nextIndex {
+		r.nextIndex[nodeID] = lastIndex + 1 // optimistic: send from end
+		r.matchIndex[nodeID] = 0            // nothing confirmed yet
+	}
+	return nil
+}
+
+func (r *Raft) setCommitIndex(index uint64) {
+	r.commitIndex = index
+	r.checkWaiters()
+}
+
+// RequestVote handles the call from candidate
+func (r *Raft) RequestVote(ctx context.Context, from NodeID, msg RequestVoteRequest) error {
+	currentTerm, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return err
+	}
+
+	// §6: if we've heard from a leader recently, reject the vote without
+	// updating our term. This prevents removed servers from disrupting
+	// the cluster by forcing leader re-elections.
+	// but this is not fully proved to be right and may cause bugs
+	minElectionTimeout := r.config.ElectionTimeoutEnd
+	sinceHeartbeat := r.now - r.getHeartbeatTime()
+	slog.Debug("RequestVote", "last heartbeat", sinceHeartbeat, "min election timeout", minElectionTimeout)
+	if sinceHeartbeat < minElectionTimeout {
+		r.transport.Send(ctx, from, RequestVoteResponse{
+			Term:    currentTerm,
+			Granted: false,
+		})
+		return nil
+	}
+
+	// current term is higher than candidate's term
+	if currentTerm > msg.Term {
+		r.transport.Send(ctx, from, RequestVoteResponse{
+			Term:    currentTerm,
+			Granted: false,
+		})
+		return nil
+	}
+
+	if msg.Term > currentTerm {
+		err = r.repository.SetCurrentTerm(ctx, msg.Term)
+		if err != nil {
+			return err
+		}
+		currentTerm = msg.Term
+	}
+
+	votedFor, err := r.repository.GetVotedFor(ctx, msg.Term)
+	if err != nil {
+		return err
+	}
+	// Already voted in this term and candidate is not the same as voted before
+	if votedFor != nil && *votedFor != string(msg.CandidateID) {
+		r.transport.Send(ctx, from, RequestVoteResponse{
+			Term:    currentTerm,
+			Granted: false,
+		})
+		return nil
+	}
+
+	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		return err
+	}
+	lastLogEntry, err := r.repository.GetEntryAtIndex(ctx, lastLogIndex)
+	if err != nil {
+		return err
+	}
+	lastLogTerm := lastLogEntry.Term
+
+	ourIsMoreUpToDate := lastLogTerm > msg.LastLogTerm ||
+		(lastLogTerm == msg.LastLogTerm && lastLogIndex > msg.LastLogIndex)
+
+	if ourIsMoreUpToDate {
+		r.transport.Send(ctx, from, RequestVoteResponse{Term: currentTerm, Granted: false})
+		return nil
+	}
+
+	err = r.repository.VoteFor(ctx, msg.Term, string(msg.CandidateID))
+	if err != nil {
+		return err
+	}
+
+	r.changeRole(raftpb.Role_FOLLOWER)
+	// reset the timer
+	r.onHeartbeat()
+
+	r.transport.Send(ctx, from, RequestVoteResponse{
+		Term:    msg.Term,
+		Granted: true,
+	})
+	return nil
+}
+
+// AppendEntries handles the call from leader that sends the log entries
+func (r *Raft) AppendEntries(ctx context.Context, from NodeID, msg AppendEntriesRequest) error {
+
+	currentTerm, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return err
+	}
+
+	if currentTerm > msg.Term {
+		r.transport.Send(ctx, from, AppendEntriesResponse{
+			Success: false,
+			Term:    currentTerm,
+			Seq:     msg.Seq,
+		})
+		return nil
+	}
+
+	if msg.Term > currentTerm {
+		if err = r.repository.SetCurrentTerm(ctx, msg.Term); err != nil {
+			return err
+		}
+		currentTerm = msg.Term
+	}
+	r.changeRole(raftpb.Role_FOLLOWER)
+	r.onHeartbeat()
+
+	prevEntry, err := r.repository.GetEntryAtIndex(ctx, msg.PrevLogIndex)
+	if err != nil {
+		if errors.Is(err, repository.ErrIndexOutofRange) {
+			r.transport.Send(ctx, from, AppendEntriesResponse{Success: false, Term: currentTerm, Seq: msg.Seq})
+			return nil
+		}
+		return err
+	}
+	if prevEntry.Term != msg.PrevLogTerm {
+		r.transport.Send(ctx, from, AppendEntriesResponse{Success: false, Term: currentTerm, Seq: msg.Seq})
+		return nil
+	}
+
+	r.setLeader(string(msg.LeaderID))
+
+	if len(msg.Entries) > 0 {
+		conflictIdx := -1
+		for i, entry := range msg.Entries {
+			absIdx := msg.PrevLogIndex + 1 + uint64(i)
+			existing, err := r.repository.GetEntryAtIndex(ctx, absIdx)
+			if err != nil || existing.Term != entry.Term {
+				conflictIdx = i
+				break
+			}
+		}
+		if conflictIdx >= 0 {
+			writeFrom := msg.PrevLogIndex + uint64(conflictIdx)
+			if err = r.repository.TruncateAndAppend(ctx, writeFrom, msg.Entries[conflictIdx:]); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Advance follower commitIndex
+	if msg.LeaderCommit > 0 {
+		lastNewIndex, err := r.repository.GetLastLogIndex(ctx)
+		if err != nil {
+			return err
+		}
+		commitUpTo := min(msg.LeaderCommit, lastNewIndex)
+		currentCommit := r.commitIndex
+		if commitUpTo > currentCommit {
+			r.setCommitIndex(commitUpTo)
+			if err = r.applyCommitted(ctx); err != nil {
+				return err
+			}
+		}
+	}
+
+	r.transport.Send(ctx, from, AppendEntriesResponse{
+		Term:    msg.Term,
+		Success: true,
+		Seq:     msg.Seq,
+	})
+	return nil
+}
+
+func (r *Raft) startElection(ctx context.Context) error {
+	newTerm, err := r.repository.IncCurrentTerm(ctx)
+	if err != nil {
+		return err
+	}
+	err = r.repository.VoteFor(ctx, newTerm, r.config.ID)
+	if err != nil {
+		return err
+	}
+
+	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		return err
+	}
+	lastLogEntry, err := r.repository.GetEntryAtIndex(ctx, lastLogIndex)
+	if err != nil {
+		return err
+	}
+	r.mu.RLock()
+	peers := maps.Clone(r.clients)
+	coldSnapshot := maps.Clone(r.cOld)
+	cnewSnapshot := maps.Clone(r.cNew)
+	inJoint := r.isJoint
+	r.mu.RUnlock()
+
+	r.electionTerm = newTerm
+	r.votes = map[string]bool{r.config.ID: true}
+	r.electionCOld = coldSnapshot
+	r.electionCNew = cnewSnapshot
+	r.electionJoint = inJoint
+
+	for _, id := range slices.Sorted(maps.Keys(peers)) {
+		r.transport.Send(ctx, NodeID(id), RequestVoteRequest{
+			Term:         newTerm,
+			CandidateID:  NodeID(r.config.ID),
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogEntry.Term,
+		})
+	}
+	return nil
+}
+
+func (r *Raft) handleRequestVoteResponse(ctx context.Context, from NodeID, msg RequestVoteResponse) error {
+	if r.getRole() != raftpb.Role_CANDIDATE {
+		return nil
+	}
+
+	if msg.Term > r.electionTerm {
+		if err := r.repository.SetCurrentTerm(ctx, msg.Term); err != nil {
+			slog.Error("update term after stale election", "error", err)
+		}
+		r.changeRole(raftpb.Role_FOLLOWER)
+		r.resetElectionDeadline()
+		slog.Error("failed to start election", "error", "discovered higher term during election")
+		return nil
+	}
+
+	if msg.Granted && msg.Term != r.electionTerm {
+		return nil
+	}
+
+	if msg.Granted {
+		r.votes[string(from)] = true
+	}
+	hasVote := func(nodeID string) bool { return r.votes[nodeID] }
+
+	// Check quorum after every vote, become leader as soon as we win.
+	if r.electionJoint {
+		if r.countQuorum(r.electionCOld, hasVote) && r.countQuorum(r.electionCNew, hasVote) {
+			r.becomeLeader(ctx)
+		}
+	} else {
+		if r.countQuorum(r.electionCOld, hasVote) {
+			r.becomeLeader(ctx)
+		}
+	}
+	return nil
+}
+
+// sendHeartbeat is used by leader to send the heartbeat
+// it is also sends entries if there are any non-sent ones
+func (r *Raft) sendHeartbeat(ctx context.Context) error {
+	term, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return err
+	}
+
+	peers := r.peerSnapshot()
+
+	for _, id := range slices.Sorted(maps.Keys(peers)) {
+		nextIdx := r.nextIndex[id]
+		prevLogIndex := nextIdx - 1
+		prevEntry, err := r.repository.GetEntryAtIndex(ctx, prevLogIndex)
+		if err != nil {
+			slog.Error("failed to get prev entry", "error", err)
+			continue
+		}
+		entries, err := r.repository.GetEntryFromIndex(ctx, prevLogIndex)
+		if err != nil {
+			continue
+		}
+		commitIndex := r.commitIndex
+		r.appendSeq++
+		r.transport.Send(ctx, NodeID(id), AppendEntriesRequest{
+			Term:         term,
+			LeaderID:     NodeID(r.config.ID),
+			PrevLogIndex: prevLogIndex,
+			Entries:      entries,
+			PrevLogTerm:  prevEntry.Term,
+			LeaderCommit: commitIndex,
+			Seq:          r.appendSeq,
+		})
+		// remember this request, only its reply is accepted
+		r.lastSent[id] = sentAppend{
+			seq:          r.appendSeq,
+			prevLogIndex: prevLogIndex,
+			matchIndex:   prevLogIndex + uint64(len(entries)),
+		}
+	}
+
+	if err := r.tryAdvanceCommitIndex(ctx); err != nil {
+		slog.Error("failed to advance commit index", "error", err)
+	}
+	return nil
+}
+
+func (r *Raft) handleAppendEntriesResponse(ctx context.Context, from NodeID, msg AppendEntriesResponse) error {
+	id := string(from)
+
+	term, err := r.repository.GetCurrentTerm(ctx)
+	if err != nil {
+		return err
+	}
+
+	if r.getRole() != raftpb.Role_LEADER {
+		return nil
+	}
+	if msg.Term < term {
+		return nil
+	}
+	sent, ok := r.lastSent[id]
+	if !ok || sent.seq != msg.Seq {
+		return nil
+	}
+	delete(r.lastSent, id)
+
+	nextIdx := sent.prevLogIndex + 1
+
+	if !msg.Success {
+		if msg.Term > term {
+			slog.Debug("discovered higher term in AppendEntries response, stepping down")
+			if err = r.repository.SetCurrentTerm(ctx, msg.Term); err != nil {
+				slog.Error("failed to update term", "error", err)
+			}
+			r.changeRole(raftpb.Role_FOLLOWER)
+			r.onHeartbeat()
+			return nil
+		}
+		// Back off next index and retry on the next heartbeat.
+		if nextIdx > 1 {
+			r.nextIndex[id] = nextIdx - 1
+		}
+		slog.Debug("AppendEntries rejected, backed off nextIndex", "nodeID", id, "newNextIndex", nextIdx-1)
+		return nil
+	}
+	newMatchIndex := sent.matchIndex
+	r.matchIndex[id] = newMatchIndex
+	r.nextIndex[id] = newMatchIndex + 1
+	slog.Debug("AppendEntries succeeded", "nodeID", id, "matchIndex", newMatchIndex)
+
+	if err := r.tryAdvanceCommitIndex(ctx); err != nil {
+		slog.Error("failed to advance commit index", "error", err)
+	}
+	return nil
 }
 
 // the replicatedOn is a function that carries if the nodeID has voted
@@ -126,7 +726,7 @@ func (r *Raft) countQuorum(members map[string]string, has func(nodeID string) bo
 }
 
 // gets the clients in lock-safe manner
-func (r *Raft) peerSnapshot() map[string]raftpb.RaftServiceClient {
+func (r *Raft) peerSnapshot() map[string]string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return maps.Clone(r.clients)
@@ -152,11 +752,10 @@ func (r *Raft) enterJoint(_ context.Context, cnew map[string]string) error {
 			continue
 		}
 		if _, exists := clients[id]; !exists {
-			conn, err := grpc.NewClient(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
+			if err := r.transport.AddPeer(NodeID(id), url); err != nil {
 				return fmt.Errorf("dial new node %s (%s): %w", id, url, err)
 			}
-			clients[id] = raftpb.NewRaftServiceClient(conn)
+			clients[id] = url
 			slog.Debug("adding to cluster", "nodeID", id)
 		}
 	}
@@ -204,7 +803,7 @@ func (r *Raft) stepDown() {
 	r.role = raftpb.Role_FOLLOWER
 	// NOTE this is not right and i just added it due to the problem for the raft membership change so i can test
 	r.cOld = map[string]string{}
-	r.clients = map[string]raftpb.RaftServiceClient{}
+	r.clients = map[string]string{}
 	slog.Info("removed self from cluster, stepping down")
 }
 
@@ -212,11 +811,11 @@ func (r *Raft) stepDown() {
 func (r *Raft) setHeartbeatTime() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.lastHeartbeat = time.Now()
+	r.lastHeartbeat = r.now
 }
 
 // gets the heartbeat time in lock-free manner
-func (r *Raft) getHeartbeatTime() time.Time {
+func (r *Raft) getHeartbeatTime() uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.lastHeartbeat
@@ -246,96 +845,18 @@ func (r *Raft) getLastKnownLeader() string {
 	return r.lastKnownLeader
 }
 
-// This method is the logic loop and runs infinitely
-func (r *Raft) Serve(ctx context.Context) error {
-	for {
-
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		slog.Debug("Starting new round", "role", r.role)
-
-		role := r.getRole()
-		switch role {
-		case raftpb.Role_FOLLOWER, raftpb.Role_CANDIDATE:
-
-			timeoutMs := (rand.Uint64N(r.config.ElectionTimeoutEnd-r.config.ElectionTimeoutStart) + r.config.ElectionTimeoutStart) * uint64(time.Millisecond)
-			ticker := time.After(time.Duration(timeoutMs))
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-
-			case <-ticker:
-				slog.Debug("ticker ticked", "role", r.getRole(), "timeoutMs", timeoutMs)
-				r.changeRole(raftpb.Role_CANDIDATE)
-				err := r.startElection()
-				if err != nil {
-					slog.Error("failed to start election", "error", err)
-				} else {
-					r.changeRole(raftpb.Role_LEADER)
-					if err := r.repository.InitLeaderState(ctx); err != nil {
-						slog.Error("failed to init leader state", "error", err)
-						r.changeRole(raftpb.Role_FOLLOWER)
-						continue
-					}
-					slog.Debug("start election succeeded; adding a no-op entry", "role", r.role)
-					// NOTE; i send it in goroutine so it won't block the send heartbeat as leader
-					go func() {
-						if err := r.commitNoOpEntry(ctx); err != nil {
-							slog.Error("failed to commit no-op entry after election", "error", err)
-							if r.getRole() == raftpb.Role_LEADER {
-								r.changeRole(raftpb.Role_FOLLOWER)
-							}
-						}
-					}()
-
-				}
-			case <-r.heartbeatCh:
-				slog.Debug("heartbeat received", "role", r.role)
-				r.setHeartbeatTime()
-				r.changeRole(raftpb.Role_FOLLOWER)
-			}
-
-		case raftpb.Role_LEADER:
-
-			timeoutMs := r.config.HeartbeatTimeout * uint64(time.Millisecond)
-			ticker := time.After(time.Duration(timeoutMs))
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-
-			case <-ticker:
-				slog.Debug("ticker ticked", "role", r.role, "timeoutMs", timeoutMs)
-				err := r.sendHeartbeat()
-				if err != nil {
-					slog.Error("failed to send heartbeat", "error", err)
-				}
-				r.setHeartbeatTime()
-			case <-r.heartbeatCh:
-				slog.Debug("heartbeat received", "role", "leader", "timeoutMs", timeoutMs)
-				r.setHeartbeatTime()
-				r.changeRole(raftpb.Role_FOLLOWER)
-			}
-		}
-	}
-}
-
 // commitNoOpEntry used by leader to send a no-op entry so it knows the latest committed entry
-func (r *Raft) commitNoOpEntry(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
+func (r *Raft) commitNoOpEntry(ctx context.Context, done func(error)) {
 	term, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
-		return err
+		done(err)
+		return
 	}
 
 	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
 	if err != nil {
-		return err
+		done(err)
+		return
 	}
 
 	entry := &raftpb.Entry{
@@ -345,16 +866,19 @@ func (r *Raft) commitNoOpEntry(ctx context.Context) error {
 	}
 
 	if err := r.repository.TruncateAndAppend(ctx, lastLogIndex, []*raftpb.Entry{entry}); err != nil {
-		return err
+		done(err)
+		return
 	}
 
 	entryIndex := lastLogIndex + 1
-	if err := r.waitForCommit(ctx, entryIndex); err != nil {
-		return err
-	}
-
-	slog.Debug("Submit succeeded", "term", term, "entryIndex", entryIndex)
-	return nil
+	r.waitForCommit(entryIndex, func(err error) {
+		if err != nil {
+			done(err)
+			return
+		}
+		slog.Debug("Submit succeeded", "term", term, "entryIndex", entryIndex)
+		done(nil)
+	})
 }
 
 // applyEntry is used to apply entry to the system.
@@ -373,11 +897,9 @@ func (r *Raft) applyEntry(ctx context.Context, entry *raftpb.Entry) error {
 			return err
 		}
 		if r.getRole() == raftpb.Role_LEADER {
-			go func() {
-				if err := r.appendFinalConfig(context.Background()); err != nil {
-					slog.Error("failed to append C_new after joint commit", "error", err)
-				}
-			}()
+			if err := r.appendFinalConfig(ctx); err != nil {
+				slog.Error("failed to append C_new after joint commit", "error", err)
+			}
 		}
 		return nil
 	case raftpb.EntryType_ENTRY_TYPE_CONFIG:
@@ -392,7 +914,7 @@ func (r *Raft) applyEntry(ctx context.Context, entry *raftpb.Entry) error {
 }
 
 // appendFinalConfig appends the C_new log entry (phase 2) after C_old,new
-// has been committed.  Called in a goroutine by the leader.
+// has been committed.
 func (r *Raft) appendFinalConfig(ctx context.Context) error {
 	term, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
@@ -423,14 +945,8 @@ func (r *Raft) appendFinalConfig(ctx context.Context) error {
 
 // applyCommitted is used to apply the entry to state machine from committed but not applied entry
 func (r *Raft) applyCommitted(ctx context.Context) error {
-	lastApplied, err := r.repository.GetLastAppliedIndex(ctx)
-	if err != nil {
-		return err
-	}
-	commitIndex, err := r.repository.GetCommitIndex(ctx)
-	if err != nil {
-		return err
-	}
+	lastApplied := r.lastApplied
+	commitIndex := r.commitIndex
 	slog.Debug("Starting applyCommitted", "lastApplied", lastApplied, "commitIndex", commitIndex)
 	for i := lastApplied + 1; i <= commitIndex; i++ {
 		entry, err := r.repository.GetEntryAtIndex(ctx, i)
@@ -440,195 +956,9 @@ func (r *Raft) applyCommitted(ctx context.Context) error {
 		if err = r.applyEntry(ctx, entry); err != nil {
 			return fmt.Errorf("apply entry at %d: %w", i, err)
 		}
-		if err = r.repository.SetLastApplied(ctx, i); err != nil {
-			return fmt.Errorf("set last applied %d: %w", i, err)
-		}
+		r.lastApplied = i
 	}
 	return nil
-}
-
-// sendHeartbeat is used by admin to send the heartbeat
-// it is also sends entries if there are any non-sent ones
-func (r *Raft) sendHeartbeat() error {
-	ctx := context.Background()
-	term, err := r.repository.GetCurrentTerm(ctx)
-	if err != nil {
-		return err
-	}
-
-	peers := r.peerSnapshot()
-
-	var wg sync.WaitGroup
-	for id, v := range peers {
-		wg.Add(1)
-		go func(id string, v raftpb.RaftServiceClient) {
-			defer wg.Done()
-
-			nextIdx, err := r.repository.GetNextIndexByNodeID(ctx, id)
-			if err != nil {
-				slog.Error("failed to get nextIndex", "nodeID", id, "error", err)
-				return
-			}
-			prevLogIndex := nextIdx - 1
-			prevEntry, err := r.repository.GetEntryAtIndex(ctx, prevLogIndex)
-			if err != nil {
-				slog.Error("failed to get prev entry", "error", err)
-				return
-			}
-			entries, err := r.repository.GetEntryFromIndex(ctx, prevLogIndex)
-			if err != nil {
-				return
-			}
-			commitIndex, err := r.repository.GetCommitIndex(ctx)
-			if err != nil {
-				return
-			}
-			resp, err := v.AppendEntries(ctx, &raftpb.AppendEntriesRequest{
-				Term:         term,
-				LeaderId:     r.config.ID,
-				PrevLogIndex: prevLogIndex,
-				Entries:      entries,
-				PrevLogTerm:  prevEntry.Term,
-				LeaderCommit: commitIndex,
-			})
-			if err != nil {
-				slog.Error("failed to AppendEntries", "error", err)
-				return
-			}
-			if !resp.Success {
-				if resp.Term > term {
-					slog.Debug("discovered higher term in AppendEntries response, stepping down")
-					if err = r.repository.SetCurrentTerm(ctx, resp.Term); err != nil {
-						slog.Error("failed to update term", "error", err)
-					}
-					r.changeRole(raftpb.Role_FOLLOWER)
-					select {
-					case r.heartbeatCh <- struct{}{}:
-					default:
-					}
-					return
-				}
-				// Back off next index and retry on the next heartbeat.
-				if nextIdx > 1 {
-					if err = r.repository.SetNextIndex(ctx, id, nextIdx-1); err != nil {
-						slog.Error("failed to decrement nextIndex", "nodeID", id, "error", err)
-					}
-				}
-				slog.Debug("AppendEntries rejected, backed off nextIndex", "nodeID", id, "newNextIndex", nextIdx-1)
-				return
-			}
-			newMatchIndex := prevLogIndex + uint64(len(entries))
-			if err = r.repository.SetMatchIndex(ctx, id, newMatchIndex); err != nil {
-				slog.Error("failed to update matchIndex", "nodeID", id, "error", err)
-				return
-			}
-			if err = r.repository.SetNextIndex(ctx, id, newMatchIndex+1); err != nil {
-				slog.Error("failed to update nextIndex", "nodeID", id, "error", err)
-				return
-			}
-			slog.Debug("AppendEntries succeeded", "nodeID", id, "matchIndex", newMatchIndex)
-		}(id, v)
-	}
-	wg.Wait()
-
-	if err := r.tryAdvanceCommitIndex(ctx); err != nil {
-		slog.Error("failed to advance commit index", "error", err)
-	}
-	return nil
-}
-
-func (r *Raft) startElection() error {
-	ctx := context.Background()
-
-	newTerm, err := r.repository.IncCurrentTerm(ctx)
-	if err != nil {
-		return err
-	}
-	err = r.repository.VoteFor(ctx, newTerm, r.config.ID)
-	if err != nil {
-		return err
-	}
-	select {
-	case r.heartbeatCh <- struct{}{}:
-	default:
-	}
-	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
-	if err != nil {
-		return err
-	}
-	lastLogEntry, err := r.repository.GetEntryAtIndex(ctx, lastLogIndex)
-	if err != nil {
-		return err
-	}
-	r.mu.RLock()
-	peers := maps.Clone(r.clients)
-	coldSnapshot := maps.Clone(r.cOld)
-	cnewSnapshot := maps.Clone(r.cNew)
-	inJoint := r.isJoint
-	r.mu.RUnlock()
-
-	type voteResult struct {
-		nodeID  string
-		granted bool
-		term    uint64
-	}
-	resultCh := make(chan voteResult, len(peers))
-	for id, client := range peers {
-		go func(id string, client raftpb.RaftServiceClient) {
-			ctx2, cancel := context.WithTimeout(ctx, 1000*time.Millisecond)
-			defer cancel()
-			resp, err := client.RequestVote(ctx2, &raftpb.RequestVoteRequest{
-				Term:         newTerm,
-				CandidateId:  r.config.ID,
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogEntry.Term,
-			})
-			if err != nil {
-				slog.Error("RequestVote failed", "nodeID", id, "error", err)
-				resultCh <- voteResult{nodeID: id, granted: false}
-				return
-			}
-			resultCh <- voteResult{nodeID: id, granted: resp.Granted, term: resp.Term}
-		}(id, client)
-	}
-
-	grantedByID := map[string]bool{r.config.ID: true}
-	hasVote := func(nodeID string) bool { return grantedByID[nodeID] }
-
-	for range peers {
-		res := <-resultCh
-
-		if res.term > newTerm {
-			if err = r.repository.SetCurrentTerm(ctx, res.term); err != nil {
-				slog.Error("update term after stale election", "error", err)
-			}
-			r.changeRole(raftpb.Role_FOLLOWER)
-			return errors.New("discovered higher term during election")
-		}
-
-		if res.granted {
-			grantedByID[res.nodeID] = true
-		}
-
-		// Check quorum after every vote - return as soon as we win.
-		if inJoint {
-			if r.countQuorum(coldSnapshot, hasVote) && r.countQuorum(cnewSnapshot, hasVote) {
-				return nil
-			}
-		} else {
-			if r.countQuorum(coldSnapshot, hasVote) {
-				return nil
-			}
-		}
-	}
-
-	// Exhausted all responses without reaching quorum.
-	if inJoint {
-		oldWon := r.countQuorum(coldSnapshot, hasVote)
-		newWon := r.countQuorum(cnewSnapshot, hasVote)
-		return fmt.Errorf("election failed: old quorum=%v new quorum=%v", oldWon, newWon)
-	}
-	return errors.New("election failed: not enough votes")
 }
 
 // tryAdvanceCommitIndex scans the log backwards from the last entry to find
@@ -648,10 +978,7 @@ func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	commitIndex, err := r.repository.GetCommitIndex(ctx)
-	if err != nil {
-		return err
-	}
+	commitIndex := r.commitIndex
 	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
 	if err != nil {
 		return err
@@ -675,221 +1002,56 @@ func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) (err error) {
 			if nodeID == selfID {
 				return true
 			}
-			matchIdx, _ := r.repository.GetMatchIndexByNodeID(ctx, nodeID)
+			matchIdx := r.matchIndex[nodeID]
 			return matchIdx >= n
 		}
 
 		if r.quorumReached(replicatedOn) {
-			if err := r.repository.SetCommitIndex(ctx, n); err != nil {
-				slog.Error("SetCommitIndex", "error", err)
-				return err
-			}
+			r.setCommitIndex(n)
 			return r.applyCommitted(ctx)
 		}
 	}
 	return nil
 }
 
-// RequestVote handles the call from candidate
-func (r *Raft) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
-	currentTerm, err := r.repository.GetCurrentTerm(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// §6: if we've heard from a leader recently, reject the vote without
-	// updating our term. This prevents removed servers from disrupting
-	// the cluster by forcing leader re-elections.
-	// but this is not fully proved to be right and may cause bugs
-	minElectionTimeout := time.Duration(r.config.ElectionTimeoutEnd) * time.Millisecond
-	slog.Debug("RequestVote", "last heartbeat", time.Since(r.getHeartbeatTime()), "min election timeout", minElectionTimeout)
-	if time.Since(r.getHeartbeatTime()) < minElectionTimeout {
-		return &raftpb.RequestVoteResponse{
-			Term:    currentTerm,
-			Granted: false,
-		}, nil
-	}
-
-	// current term is higher than candidate's term
-	if currentTerm > req.Term {
-		return &raftpb.RequestVoteResponse{
-			Term:    currentTerm,
-			Granted: false,
-		}, nil
-	}
-
-	if req.Term > currentTerm {
-		err = r.repository.SetCurrentTerm(ctx, req.Term)
-		if err != nil {
-			return nil, err
-		}
-		currentTerm = req.Term
-	}
-
-	votedFor, err := r.repository.GetVotedFor(ctx, req.Term)
-	if err != nil {
-		return nil, err
-	}
-	// Already voted in this term and candidate is not the same as voted before
-	if votedFor != nil && *votedFor != req.CandidateId {
-		return &raftpb.RequestVoteResponse{
-			Term:    currentTerm,
-			Granted: false,
-		}, nil
-	}
-
-	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
-	if err != nil {
-		return nil, err
-	}
-	lastLogEntry, err := r.repository.GetEntryAtIndex(ctx, lastLogIndex)
-	if err != nil {
-		return nil, err
-	}
-	lastLogTerm := lastLogEntry.Term
-
-	ourIsMoreUpToDate := lastLogTerm > req.LastLogTerm ||
-		(lastLogTerm == req.LastLogTerm && lastLogIndex > req.LastLogIndex)
-
-	if ourIsMoreUpToDate {
-		return &raftpb.RequestVoteResponse{Term: currentTerm, Granted: false}, nil
-	}
-
-	err = r.repository.VoteFor(ctx, req.Term, req.CandidateId)
-	if err != nil {
-		return nil, err
-	}
-
-	r.changeRole(raftpb.Role_FOLLOWER)
-	// reset the timer
-	select {
-	case r.heartbeatCh <- struct{}{}:
-	default:
-	}
-
-	return &raftpb.RequestVoteResponse{
-		Term:    req.Term,
-		Granted: true,
-	}, nil
-}
-
-// AppendEntries handles the call from leader that sends the log entries
-func (r *Raft) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
-
-	currentTerm, err := r.repository.GetCurrentTerm(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	if currentTerm > req.Term {
-		return &raftpb.AppendEntriesResponse{
-			Success: false,
-			Term:    currentTerm,
-		}, nil
-	}
-
-	if req.Term > currentTerm {
-		if err = r.repository.SetCurrentTerm(ctx, req.Term); err != nil {
-			return nil, err
-		}
-		currentTerm = req.Term
-	}
-	r.changeRole(raftpb.Role_FOLLOWER)
-	select {
-	case r.heartbeatCh <- struct{}{}:
-	default:
-	}
-
-	prevEntry, err := r.repository.GetEntryAtIndex(ctx, req.PrevLogIndex)
-	if err != nil {
-		if errors.Is(err, repository.ErrIndexOutofRange) {
-			return &raftpb.AppendEntriesResponse{Success: false, Term: currentTerm}, nil
-		}
-		return nil, err
-	}
-	if prevEntry.Term != req.PrevLogTerm {
-		return &raftpb.AppendEntriesResponse{Success: false, Term: currentTerm}, nil
-	}
-
-	r.setLeader(req.LeaderId)
-
-	if len(req.Entries) > 0 {
-		conflictIdx := -1
-		for i, entry := range req.Entries {
-			absIdx := req.PrevLogIndex + 1 + uint64(i)
-			existing, err := r.repository.GetEntryAtIndex(ctx, absIdx)
-			if err != nil || existing.Term != entry.Term {
-				conflictIdx = i
-				break
-			}
-		}
-		if conflictIdx >= 0 {
-			writeFrom := req.PrevLogIndex + uint64(conflictIdx)
-			if err = r.repository.TruncateAndAppend(ctx, writeFrom, req.Entries[conflictIdx:]); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	// Advance follower commitIndex
-	if req.LeaderCommit > 0 {
-		lastNewIndex, err := r.repository.GetLastLogIndex(ctx)
-		if err != nil {
-			return nil, err
-		}
-		commitUpTo := min(req.LeaderCommit, lastNewIndex)
-		currentCommit, err := r.repository.GetCommitIndex(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if commitUpTo > currentCommit {
-			if err = r.repository.SetCommitIndex(ctx, commitUpTo); err != nil {
-				return nil, err
-			}
-			if err = r.applyCommitted(ctx); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	return &raftpb.AppendEntriesResponse{
-		Term:    req.Term,
-		Success: true,
-	}, nil
-}
-
 // Submit is used to set a command to the state machine
-func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.SubmitResponse, error) {
+func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest, reply func(*raftpb.SubmitResponse, error)) {
 
 	if req.Command == "" || req.SerialNumber == "" {
-		return nil, status.Error(codes.InvalidArgument, "Command/SerialNumber not provided")
+		reply(nil, status.Error(codes.InvalidArgument, "Command/SerialNumber not provided"))
+		return
 	}
 
 	role := r.getRole()
 	if role != raftpb.Role_LEADER {
-		return &raftpb.SubmitResponse{
+		reply(&raftpb.SubmitResponse{
 			Success:  false,
 			LeaderId: r.getLastKnownLeader(),
-		}, nil
+		}, nil)
+		return
 	}
 
 	if success, err := r.repository.GetSerialNumber(ctx, req.SerialNumber); err != nil {
-		return nil, err
+		reply(nil, err)
+		return
 	} else if success {
-		return &raftpb.SubmitResponse{
+		reply(&raftpb.SubmitResponse{
 			LeaderId: r.config.ID,
 			Success:  success,
-		}, nil
+		}, nil)
+		return
 	}
 
 	term, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
-		return nil, err
+		reply(nil, err)
+		return
 	}
 
 	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
 	if err != nil {
-		return nil, err
+		reply(nil, err)
+		return
 	}
 
 	entry := &raftpb.Entry{
@@ -899,20 +1061,26 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest) (*raftpb.S
 	}
 
 	if err := r.repository.TruncateAndAppend(ctx, lastLogIndex, []*raftpb.Entry{entry}); err != nil {
-		return nil, err
+		reply(nil, err)
+		return
 	}
 
 	entryIndex := lastLogIndex + 1
-	if err := r.waitForCommit(ctx, entryIndex); err != nil {
-		return nil, err
-	}
+	r.waitForCommit(entryIndex, func(err error) {
+		if err != nil {
+			reply(nil, err)
+			return
+		}
 
-	if err := r.repository.SetSerialNumber(ctx, req.SerialNumber, true); err != nil {
-		return nil, err
-	}
+		if err := r.repository.SetSerialNumber(ctx, req.SerialNumber, true); err != nil {
+			reply(nil, err)
+			return
+		}
 
-	slog.Debug("Submit succeeded", "term", term, "entryIndex", entryIndex)
-	return &raftpb.SubmitResponse{Success: true}, nil
+		slog.Debug("Submit succeeded", "term", term, "entryIndex", entryIndex)
+		// this is the moment the write is acknowledged
+		reply(&raftpb.SubmitResponse{Success: true}, nil)
+	})
 }
 
 // Get is used to do a read operation on the state machine
@@ -929,7 +1097,7 @@ func (r *Raft) Get(ctx context.Context, req *raftpb.GetRequest) (*raftpb.GetResp
 		}, nil
 	}
 
-	if err := r.sendHeartbeat(); err != nil {
+	if err := r.sendHeartbeat(ctx); err != nil {
 		return nil, err
 	}
 
@@ -954,12 +1122,13 @@ func (r *Raft) Get(ctx context.Context, req *raftpb.GetRequest) (*raftpb.GetResp
 // Phase 2 (triggered automatically in applyEntry after phase 1 commits):
 //   - Leader appends C_new entry.
 //   - On commit exitJoint promotes C_new → C_old.
-func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest) (*raftpb.ChangeNodesResponse, error) {
+func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest, reply func(*raftpb.ChangeNodesResponse, error)) {
 	if r.getRole() != raftpb.Role_LEADER {
-		return &raftpb.ChangeNodesResponse{
+		reply(&raftpb.ChangeNodesResponse{
 			Success:  false,
 			LeaderId: proto.String(r.getLastKnownLeader()),
-		}, nil
+		}, nil)
+		return
 	}
 
 	r.mu.RLock()
@@ -967,7 +1136,8 @@ func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest) 
 	r.mu.RUnlock()
 
 	if inJoint {
-		return nil, errors.New("membership change already in progress")
+		reply(nil, errors.New("membership change already in progress"))
+		return
 	}
 
 	// Build C_new.
@@ -981,22 +1151,26 @@ func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest) 
 	maps.Copy(cnew, req.AddNodes)
 
 	if len(cnew) == 0 {
-		return nil, errors.New("resulting cluster would be empty")
+		reply(nil, errors.New("resulting cluster would be empty"))
+		return
 	}
 
 	// Activate joint mode BEFORE appending the entry so quorum checks
 	// during replication already honour both configs (Raft §6).
 	if err := r.enterJoint(ctx, cnew); err != nil {
-		return nil, fmt.Errorf("enter joint: %w", err)
+		reply(nil, fmt.Errorf("enter joint: %w", err))
+		return
 	}
 
 	term, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
-		return nil, err
+		reply(nil, err)
+		return
 	}
 	lastIdx, err := r.repository.GetLastLogIndex(ctx)
 	if err != nil {
-		return nil, err
+		reply(nil, err)
+		return
 	}
 
 	jointEntry := &raftpb.Entry{
@@ -1005,39 +1179,54 @@ func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest) 
 		Config: &raftpb.ClusterConfig{Nodes: cnew},
 	}
 	if err := r.repository.TruncateAndAppend(ctx, lastIdx, []*raftpb.Entry{jointEntry}); err != nil {
-		return nil, err
+		reply(nil, err)
+		return
 	}
 
 	// Wait for phase-1 to commit.  Phase-2 is triggered automatically by
 	// applyEntry once the joint entry is applied.
 	jointIndex := lastIdx + 1
-	if err := r.waitForCommit(ctx, jointIndex); err != nil {
-		return nil, fmt.Errorf("wait for C_old,new commit: %w", err)
-	}
-
-	return &raftpb.ChangeNodesResponse{Success: true}, nil
+	r.waitForCommit(jointIndex, func(err error) {
+		if err != nil {
+			reply(nil, fmt.Errorf("wait for C_old,new commit: %w", err))
+			return
+		}
+		reply(&raftpb.ChangeNodesResponse{Success: true}, nil)
+	})
 }
 
-func (r *Raft) waitForCommit(ctx context.Context, index uint64) error {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
+// registers a waiter. done runs when commitIndex >= index, or after 5s.
+func (r *Raft) waitForCommit(index uint64, done func(error)) {
+	r.waiters = append(r.waiters, commitWaiter{
+		index:    index,
+		deadline: r.now + 5000, // timeout so the client doesn't wait forever
+		done:     done,
+	})
+}
 
-	// timeout so the client doesn't wait forever
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+// checkWaiters runs when commitIndex changes and on every Tick.
+func (r *Raft) checkWaiters() {
+	type fire struct {
+		done func(error)
+		err  error
+	}
+	var fired []fire
+	kept := make([]commitWaiter, 0, len(r.waiters))
 
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timed out waiting for index %d to commit", index)
-		case <-ticker.C:
-			commitIndex, err := r.repository.GetCommitIndex(ctx)
-			if err != nil {
-				return err
-			}
-			if commitIndex >= index {
-				return nil
-			}
+	for _, w := range r.waiters {
+		switch {
+		case r.commitIndex >= w.index:
+			fired = append(fired, fire{done: w.done})
+		case r.now >= w.deadline:
+			fired = append(fired, fire{done: w.done, err: fmt.Errorf("timed out waiting for index %d to commit", w.index)})
+		default:
+			kept = append(kept, w)
 		}
+	}
+	r.waiters = kept
+
+	// call after the list is updated: a callback may add a new waiter
+	for _, f := range fired {
+		f.done(f.err)
 	}
 }

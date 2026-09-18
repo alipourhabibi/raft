@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
@@ -19,8 +18,6 @@ const (
 	CURRENT_TERM_KEY = "current_term"
 	VOTES_KEY        = "votes"
 	LOGS_KEY         = "logs"
-	NEXT_INDEX_KEY   = "next_index"
-	MATCH_INDEX_KEY  = "match_index"
 	CLUSTER_CONFIG   = "cluster_config"
 	SERIAL_NUMBER    = "serial_number"
 )
@@ -43,25 +40,11 @@ func NewRedisDB(ctx context.Context, cfg *config.Config, infra *redis.RedisInfra
 		}
 	}
 
-	pipe := infra.Client.Pipeline()
-	for nodeID := range cfg.Nodes {
-		pipe.HSetNX(ctx, NEXT_INDEX_KEY, nodeID, 1)
-		pipe.HSetNX(ctx, MATCH_INDEX_KEY, nodeID, 0)
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return nil, fmt.Errorf("init leader state: %w", err)
-	}
-
 	return db, nil
 }
 
 type RedisDB struct {
-	mu sync.RWMutex
-
 	redis *redis.RedisInfra
-
-	commitIndex uint64
-	lastApplied uint64
 }
 
 func marshalEntry(e *raftpb.Entry) ([]byte, error) {
@@ -111,32 +94,6 @@ func (r *RedisDB) GetVotedFor(ctx context.Context, term uint64) (*string, error)
 func (r *RedisDB) VoteFor(ctx context.Context, term uint64, node string) error {
 	field := strconv.FormatUint(term, 10)
 	return r.redis.Client.HSet(ctx, VOTES_KEY, field, node).Err()
-}
-
-func (r *RedisDB) GetCommitIndex(ctx context.Context) (uint64, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.commitIndex, nil
-}
-
-func (r *RedisDB) SetCommitIndex(ctx context.Context, index uint64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.commitIndex = index
-	return nil
-}
-
-func (r *RedisDB) GetLastAppliedIndex(ctx context.Context) (uint64, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.lastApplied, nil
-}
-
-func (r *RedisDB) SetLastApplied(ctx context.Context, index uint64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.lastApplied = index
-	return nil
 }
 
 func (r *RedisDB) GetLastLogIndex(ctx context.Context) (uint64, error) {
@@ -192,56 +149,6 @@ func (r *RedisDB) TruncateAndAppend(ctx context.Context, fromIndex uint64, entri
 		}
 	}
 	return nil
-}
-
-func (r *RedisDB) InitLeaderState(ctx context.Context) error {
-	lastIndex, err := r.GetLastLogIndex(ctx)
-	if err != nil {
-		return err
-	}
-
-	fields, err := r.redis.Client.HKeys(ctx, NEXT_INDEX_KEY).Result()
-	if err != nil {
-		return err
-	}
-
-	pipe := r.redis.Client.Pipeline()
-	for _, nodeID := range fields {
-		pipe.HSet(ctx, NEXT_INDEX_KEY, nodeID, lastIndex+1)
-		pipe.HSet(ctx, MATCH_INDEX_KEY, nodeID, 0)
-	}
-	_, err = pipe.Exec(ctx)
-	return err
-}
-
-func (r *RedisDB) GetNextIndexByNodeID(ctx context.Context, nodeID string) (uint64, error) {
-	val, err := r.redis.Client.HGet(ctx, NEXT_INDEX_KEY, nodeID).Uint64()
-	if err != nil {
-		if errors.Is(err, goredis.Nil) {
-			return 1, nil
-		}
-		return 0, err
-	}
-	return val, nil
-}
-
-func (r *RedisDB) SetNextIndex(ctx context.Context, nodeID string, index uint64) error {
-	return r.redis.Client.HSet(ctx, NEXT_INDEX_KEY, nodeID, index).Err()
-}
-
-func (r *RedisDB) GetMatchIndexByNodeID(ctx context.Context, nodeID string) (uint64, error) {
-	val, err := r.redis.Client.HGet(ctx, MATCH_INDEX_KEY, nodeID).Uint64()
-	if err != nil {
-		if errors.Is(err, goredis.Nil) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	return val, nil
-}
-
-func (r *RedisDB) SetMatchIndex(ctx context.Context, nodeID string, index uint64) error {
-	return r.redis.Client.HSet(ctx, MATCH_INDEX_KEY, nodeID, index).Err()
 }
 
 func (r *RedisDB) GetClusterConfig(ctx context.Context) (*raftpb.ClusterConfig, error) {

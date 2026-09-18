@@ -19,6 +19,9 @@ type Config struct {
 
 	HeartbeatTimeout uint64 `env:"HEARTBEAT_TIMEOUT"`
 
+	// how many ms one Tick moves logical time
+	TickInterval uint64 `env:"TICK_INTERVAL" envDefault:"10"`
+
 	RedisHost     string `env:"REDIS_HOST"`
 	RedisPassword string `env:"REDIS_PASSWORD"`
 	RedisDB       int    `env:"REDIS_DB"`

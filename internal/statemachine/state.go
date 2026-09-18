@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/alipourhabibi/raft/gen/go/raft/v1"
+	raft "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
 	repository "github.com/alipourhabibi/raft/internal/repository/statemachine"
 )

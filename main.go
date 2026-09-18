@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"syscall"
@@ -77,9 +80,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	r, err := raft.NewRaftService(repo, config, s)
+	transport := grpc.NewTransport(config.ID)
+
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		slog.Error("failed to read random seed", "error", err)
+		os.Exit(1)
+	}
+	seed1 := binary.LittleEndian.Uint64(b[:8])
+	seed2 := binary.LittleEndian.Uint64(b[8:])
+	slog.Info("raft seed", "seed1", seed1, "seed2", seed2)
+	rng := rand.New(rand.NewPCG(seed1, seed2))
+
+	r, err := raft.NewRaftService(repo, config, s, transport, rng)
 	if err != nil {
-		slog.Error("failed to create memory db", "error", err)
+		slog.Error("failed to create raft service", "error", err)
 		os.Exit(1)
 	}
 
