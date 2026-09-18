@@ -15,6 +15,20 @@ To run multiple nodes and monitor the logs:
 ```
 And after a moment kill the script and look at the logs on `raft-combined.log.out`
 
+## Design
+
+The protocol is event driven. No code waits for a reply inside the same
+call. Messages are one way: a request is sent, and the reply arrives
+later as its own event.
+
+* `Step(from, msg)` handles one message
+* `Tick()` moves logical time (election and heartbeat timeouts)
+* `Serve()` is the production driver: it only feeds `Step` and `Tick`
+* `Transport` sends messages; gRPC is one implementation
+
+This shape makes the node testable in a deterministic simulator, and it
+removes the liveness risk of blocking on a slow peer.
+
 ## Usage
 
 ### 1. Write (Submit)
@@ -35,12 +49,12 @@ All writes must go through the **leader**.
 1. Send request to any node
 2. If not leader → you get:
 
-   ```json
+```json
    {
      "success": false,
      "leader_id": "node1"
    }
-   ```
+```
 3. Retry on leader
 4. Leader:
 
@@ -48,6 +62,8 @@ All writes must go through the **leader**.
    * replicates to quorum
    * commits
    * applies to state machine
+   * replies to the client when the commit index passes the entry
+     (the request is not answered inside the call)
 
 #### Response
 
@@ -75,8 +91,12 @@ Reads must also go through the **leader**.
 2. If not leader → redirect
 3. Leader:
 
-   * sends heartbeat (safety)
+   * sends a heartbeat round (it does not wait for the replies yet)
    * reads from state machine
+
+> Note: the leader does not confirm its leadership before reading,
+> so a partitioned leader can return stale data. ReadIndex is not
+> implemented yet.
 
 #### Response
 
