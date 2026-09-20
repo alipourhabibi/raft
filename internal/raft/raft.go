@@ -236,7 +236,9 @@ func (r *Raft) Serve(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case env := <-r.inbox:
-			r.Step(ctx, env.from, env.msg)
+			if err := r.Step(ctx, env.from, env.msg); err != nil {
+				slog.Error(err.Error())
+			}
 		case <-ticker.C:
 			r.Tick(ctx)
 		}
@@ -254,7 +256,7 @@ func (r *Raft) Deliver(ctx context.Context, from NodeID, msg Message) error {
 }
 
 // Step handles one message.
-func (r *Raft) Step(ctx context.Context, from NodeID, msg Message) {
+func (r *Raft) Step(ctx context.Context, from NodeID, msg Message) error {
 	var err error
 	switch m := msg.(type) {
 	case RequestVoteRequest:
@@ -272,11 +274,12 @@ func (r *Raft) Step(ctx context.Context, from NodeID, msg Message) {
 	case ChangeNodesRequest:
 		r.ChangeNodes(ctx, m.Req, m.Reply)
 	default:
-		slog.Error("unknown message", "type", fmt.Sprintf("%T", msg))
+		return fmt.Errorf("unknown message type %T", msg)
 	}
 	if err != nil {
-		slog.Error("step failed", "from", from, "type", fmt.Sprintf("%T", msg), "error", err)
+		return fmt.Errorf("step %T from %s: %w", msg, from, err)
 	}
+	return nil
 }
 
 // Tick moves logical time

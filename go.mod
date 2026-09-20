@@ -1,8 +1,9 @@
 module github.com/alipourhabibi/raft
 
-go 1.25.4
+go 1.26.6
 
 require (
+	github.com/alipourhabibi/detsim v0.0.0-20260920053504-43efe07b6abc
 	github.com/caarlos0/env/v11 v11.4.0
 	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.7.1
