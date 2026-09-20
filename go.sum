@@ -1,7 +1,5 @@
-github.com/alipourhabibi/detsim v0.0.0-20260919141645-f3124cc0192f h1:XW9MPMnxbgMyE8ek5K378reSlOX3CLQo24m1OwtItBc=
-github.com/alipourhabibi/detsim v0.0.0-20260919141645-f3124cc0192f/go.mod h1:bpvUgvLT9GcbZiRuMgA6QzDOftK3Ge9h75xRfM+eESM=
-github.com/alipourhabibi/detsim v0.0.0-20260920053504-43efe07b6abc h1:LJ3DIX4xwLSNESkgTIJGL/o6JODE5GHed8Wgf0//JnM=
-github.com/alipourhabibi/detsim v0.0.0-20260920053504-43efe07b6abc/go.mod h1:bpvUgvLT9GcbZiRuMgA6QzDOftK3Ge9h75xRfM+eESM=
+github.com/alipourhabibi/detsim v0.0.0-20260920063808-5f8ab03dfd9b h1:t6O0HDLQAQUfj7pCuyCAk88p8t+YKRCheeoxPwX+88w=
+github.com/alipourhabibi/detsim v0.0.0-20260920063808-5f8ab03dfd9b/go.mod h1:bpvUgvLT9GcbZiRuMgA6QzDOftK3Ge9h75xRfM+eESM=
 github.com/bsm/ginkgo/v2 v2.12.0 h1:Ny8MWAHyOepLGlLKYmXG4IEkioBysk6GpaRTLC8zwWs=
 github.com/bsm/ginkgo/v2 v2.12.0/go.mod h1:SwYbGRRDovPVboqFv0tPTcG1sN61LM1Z4ARdbAV9g4c=
 github.com/bsm/gomega v1.27.10 h1:yeMWxP2pV2fG3FgAODIY8EiRE3dy0aeFYt4l7wh6yKA=

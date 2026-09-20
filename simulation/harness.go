@@ -9,14 +9,8 @@ import (
 	"github.com/alipourhabibi/detsim/sim"
 	"github.com/alipourhabibi/raft/internal/config"
 	"github.com/alipourhabibi/raft/internal/raft"
+	"github.com/alipourhabibi/raft/internal/statemachine"
 )
-
-type Cluster struct {
-	Sim      *sim.Sim
-	NodesInt map[raft.NodeID]int
-	Nodes    []*driver
-	NodesMap map[raft.NodeID]*driver
-}
 
 type driver struct {
 	node *raft.Raft
@@ -90,10 +84,15 @@ func (d *driver) OnRestart(ctx *sim.Ctx) {
 	d.turn.Enter(ctx)
 	defer d.turn.Leave()
 
+	sm, err := statemachine.NewStateMachine(d.cfg, &smRepo{d.turn})
+	if err != nil {
+		panic(fmt.Sprintf("harness: state machine: %v", err))
+	}
+
 	node, err := raft.NewRaftService(
 		&store{d.turn},
 		d.cfg,
-		nil, // TODO state machine
+		sm,
 		&transport{turn: d.turn, ids: d.ids},
 		simRand{turn: d.turn},
 	)
@@ -104,56 +103,8 @@ func (d *driver) OnRestart(ctx *sim.Ctx) {
 	ctx.SetTimer("tick", sim.Duration(d.cfg.TickInterval))
 }
 
-func Build(cfg sim.Config, ids []raft.NodeID, cfgs map[raft.NodeID]*config.Config) *Cluster {
-	nodesMap := map[int]raft.NodeID{}
-	nodesInt := map[raft.NodeID]int{}
-	simNodes := make([]int, len(ids))
-
-	for id, nodeID := range ids {
-		nodesMap[id] = nodeID
-		nodesInt[nodeID] = id
-		simNodes[id] = id
-	}
-
-	drivers := map[int]*driver{}
-
-	factory := func() sim.NodeFactory {
-		return func(id int) sim.Handler {
-			nodeConfig := cfgs[nodesMap[id]]
-			d := &driver{
-				turn:     &sim.Turn{},
-				cfg:      nodeConfig,
-				ids:      nodesInt,
-				nodesMap: nodesMap,
-			}
-			drivers[id] = d
-			return d
-		}
-	}
-
-	s := sim.New(cfg, simNodes, factory())
-
-	c := &Cluster{
-		Sim:      s,
-		NodesInt: nodesInt,
-		Nodes:    make([]*driver, len(ids)),
-		NodesMap: map[raft.NodeID]*driver{},
-	}
-	for i, nodeID := range ids {
-		c.Nodes[i] = drivers[i]
-		c.NodesMap[nodeID] = drivers[i]
-	}
-	return c
-}
-
 func (d *driver) StateDigest(ctx *sim.Ctx, w io.Writer) {
-	d.turn.Enter(ctx)
-	defer d.turn.Leave()
-
-	snap, err := d.node.Snapshot(context.Background())
-	if err != nil {
-		panic(fmt.Sprintf("harness: snapshot: %v", err))
-	}
+	snap := d.snapshot(ctx)
 
 	var b [8]byte
 	put := func(v uint64) {
@@ -169,14 +120,20 @@ func (d *driver) StateDigest(ctx *sim.Ctx, w io.Writer) {
 }
 
 func (d *driver) StateString(ctx *sim.Ctx) string {
+	snap := d.snapshot(ctx)
+
+	return fmt.Sprintf("%s term=%d commit=%d applied=%d last=%d leader=%s",
+		snap.Role, snap.Term, snap.CommitIndex,
+		snap.LastApplied, snap.LastLogIndex, snap.LeaderID)
+}
+
+func (d *driver) snapshot(ctx *sim.Ctx) raft.Snapshot {
 	d.turn.Enter(ctx)
 	defer d.turn.Leave()
 
 	snap, err := d.node.Snapshot(context.Background())
 	if err != nil {
-		panic(fmt.Sprintf("harness: snapshot: %v", err))
+		panic(fmt.Sprintf("harness: snapshot %s: %v", d.cfg.ID, err))
 	}
-	return fmt.Sprintf("%s term=%d commit=%d applied=%d last=%d leader=%s",
-		snap.Role, snap.Term, snap.CommitIndex,
-		snap.LastApplied, snap.LastLogIndex, snap.LeaderID)
+	return snap
 }
