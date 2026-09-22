@@ -119,6 +119,7 @@ func hashEntry(w io.Writer, e *raftpb.Entry) {
 	hashU64(w, 1)
 	hashU64(w, e.Term)
 	hashString(w, e.Command)
+	hashString(w, e.SerialNumber)
 	hashU64(w, uint64(e.Type))
 	if e.Config == nil {
 		hashU64(w, 0)

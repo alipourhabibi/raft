@@ -172,6 +172,7 @@ type Entry struct {
 	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
 	Type          EntryType              `protobuf:"varint,3,opt,name=type,proto3,enum=raft.v1.EntryType" json:"type,omitempty"`
 	Config        *ClusterConfig         `protobuf:"bytes,4,opt,name=config,proto3" json:"config,omitempty"`
+	SerialNumber  string                 `protobuf:"bytes,5,opt,name=serial_number,json=serialNumber,proto3" json:"serial_number,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -232,6 +233,13 @@ func (x *Entry) GetConfig() *ClusterConfig {
 		return x.Config
 	}
 	return nil
+}
+
+func (x *Entry) GetSerialNumber() string {
+	if x != nil {
+		return x.SerialNumber
+	}
+	return ""
 }
 
 type RequestVoteRequest struct {
@@ -928,12 +936,13 @@ const file_raft_v1_raft_proto_rawDesc = "" +
 	"\n" +
 	"NodesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8d\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb2\x01\n" +
 	"\x05Entry\x12\x18\n" +
 	"\acommand\x18\x01 \x01(\tR\acommand\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x04R\x04term\x12&\n" +
 	"\x04type\x18\x03 \x01(\x0e2\x12.raft.v1.EntryTypeR\x04type\x12.\n" +
-	"\x06config\x18\x04 \x01(\v2\x16.raft.v1.ClusterConfigR\x06config\"\xa9\x01\n" +
+	"\x06config\x18\x04 \x01(\v2\x16.raft.v1.ClusterConfigR\x06config\x12#\n" +
+	"\rserial_number\x18\x05 \x01(\tR\fserialNumber\"\xa9\x01\n" +
 	"\x12RequestVoteRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fcandidate_id\x18\x02 \x01(\tR\vcandidateId\x12$\n" +

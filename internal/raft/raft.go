@@ -917,7 +917,23 @@ func (r *Raft) applyEntry(ctx context.Context, entry *raftpb.Entry) error {
 		}
 		return r.repository.SetClusterConfig(ctx, entry.Config)
 	default:
-		return r.stateMachine.Apply(ctx, entry)
+		if entry.SerialNumber != "" {
+			seen, err := r.repository.GetSerialNumber(ctx, entry.SerialNumber)
+			if err != nil {
+				return err
+			}
+			if seen {
+				slog.Debug("skip duplicate entry", "serial", entry.SerialNumber)
+				return nil
+			}
+		}
+		if err := r.stateMachine.Apply(ctx, entry); err != nil {
+			return err
+		}
+		if entry.SerialNumber != "" {
+			return r.repository.SetSerialNumber(ctx, entry.SerialNumber, true)
+		}
+		return nil
 	}
 }
 
@@ -1063,9 +1079,10 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest, reply func
 	}
 
 	entry := &raftpb.Entry{
-		Term:    term,
-		Command: string(req.Command),
-		Type:    raftpb.EntryType_ENTRY_TYPE_COMMAND,
+		Term:         term,
+		Command:      string(req.Command),
+		Type:         raftpb.EntryType_ENTRY_TYPE_COMMAND,
+		SerialNumber: req.SerialNumber,
 	}
 
 	if err := r.repository.TruncateAndAppend(ctx, lastLogIndex, []*raftpb.Entry{entry}); err != nil {
@@ -1076,11 +1093,6 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest, reply func
 	entryIndex := lastLogIndex + 1
 	r.waitForCommit(entryIndex, func(err error) {
 		if err != nil {
-			reply(nil, err)
-			return
-		}
-
-		if err := r.repository.SetSerialNumber(ctx, req.SerialNumber, true); err != nil {
 			reply(nil, err)
 			return
 		}

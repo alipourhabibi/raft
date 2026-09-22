@@ -26,6 +26,7 @@ message Entry {
   uint64 term = 2;
   EntryType type = 3;
   ClusterConfig config = 4;
+  string serial_number = 5;
 }
 
 message RequestVoteRequest {
