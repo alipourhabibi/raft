@@ -34,3 +34,8 @@ func (r *Raft) Snapshot(ctx context.Context) (Snapshot, error) {
 		LastLogIndex: lastIdx,
 	}, nil
 }
+
+// LogEntries returns the whole logs
+func (r *Raft) LogEntries(ctx context.Context) ([]*raftpb.Entry, error) {
+	return r.repository.GetEntryFromIndex(ctx, 0)
+}

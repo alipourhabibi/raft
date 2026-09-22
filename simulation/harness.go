@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/alipourhabibi/detsim/sim"
+	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
 	"github.com/alipourhabibi/raft/internal/raft"
 	"github.com/alipourhabibi/raft/internal/statemachine"
@@ -58,13 +59,61 @@ func (d *driver) OnMessage(ctx *sim.Ctx, from int, msg sim.Message) {
 	d.turn.Enter(ctx)
 	defer d.turn.Leave()
 
-	m, ok := msg.(wire)
-	if !ok {
-		panic(fmt.Sprintf("harness: invalid message type %T in OnMessage; should be wire", msg))
+	var raftFrom raft.NodeID
+	var raftMsg raft.Message
+
+	switch m := msg.(type) {
+	case wire: // from another raft node
+		raftFrom = d.nodesMap[from]
+		raftMsg = m.msg
+
+	case ClientSubmit: // from a client node
+		raftMsg = d.submitRequest(from, m)
+
+	case ClientGet: // from a client node
+		raftMsg = d.getRequest(from, m)
+
+	default:
+		panic(fmt.Sprintf("harness: unexpected %T", msg))
 	}
 
-	if err := d.node.Step(context.Background(), d.nodesMap[from], m.msg); err != nil {
+	if err := d.node.Step(context.Background(), raftFrom, raftMsg); err != nil {
 		panic(fmt.Sprintf("harness: node %s: %v", d.cfg.ID, err))
+	}
+}
+
+// submitRequest wraps a client write.
+func (d *driver) submitRequest(client int, m ClientSubmit) raft.SubmitRequest {
+	return raft.SubmitRequest{
+		Req: &raftpb.SubmitRequest{Command: m.Command, SerialNumber: m.Serial},
+		Reply: func(resp *raftpb.SubmitResponse, err error) {
+			out := ClientSubmitResp{Serial: m.Serial}
+			if err != nil {
+				out.Err = err.Error()
+			} else {
+				out.Success = resp.Success
+				out.LeaderID = resp.LeaderId
+			}
+			d.turn.Ctx().Send(client, out)
+		},
+	}
+}
+
+// getRequest wraps a client read.
+func (d *driver) getRequest(client int, m ClientGet) raft.GetRequest {
+	return raft.GetRequest{
+		Req: &raftpb.GetRequest{Command: m.Command},
+		Reply: func(resp *raftpb.GetResponse, err error) {
+			out := ClientGetResp{Serial: m.Serial}
+			if err != nil {
+				out.Err = err.Error()
+			} else {
+				out.Status = resp.Status
+				out.Value = resp.Value
+				out.LeaderID = resp.LeaderId
+			}
+			d.turn.Ctx().Send(client, out)
+		},
 	}
 }
 
@@ -136,4 +185,14 @@ func (d *driver) snapshot(ctx *sim.Ctx) raft.Snapshot {
 		panic(fmt.Sprintf("harness: snapshot %s: %v", d.cfg.ID, err))
 	}
 	return snap
+}
+
+func (d *driver) logEntries(ctx *sim.Ctx) []*raftpb.Entry {
+	d.turn.Enter(ctx)
+	defer d.turn.Leave()
+	entries, err := d.node.LogEntries(context.Background())
+	if err != nil {
+		panic(fmt.Sprintf("harness: log %s: %v", d.cfg.ID, err))
+	}
+	return entries
 }

@@ -1,7 +1,9 @@
 package simulation
 
 import (
+	"fmt"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/alipourhabibi/detsim/sim"
@@ -13,61 +15,78 @@ import (
 type Cluster struct {
 	Sim      *sim.Sim
 	NodesInt map[raft.NodeID]int
-	Nodes    []*driver
-	NodesMap map[raft.NodeID]*driver
+
+	Servers []int // sim ids of servers
+	Clients []int // sim ids of clients
 }
 
-func Build(cfg sim.Config, ids []raft.NodeID, cfgs map[raft.NodeID]*config.Config) *Cluster {
+func New(opts ClusterOpts) *Cluster {
+	simCfg := sim.Config{
+		Seed:          opts.Seed,
+		MaxEvents:     1_000_000,
+		TraceLevel:    sim.TraceHashEventsAndState,
+		TraceKeep:     sim.KeepAll,
+		NetworkConfig: opts.Network,
+	}
+
+	cl := Build(simCfg, opts.Nodes, NodeConfigs(opts.Nodes), opts.Clients)
+	cl.Sim.AddInvariant(OneLeaderPerTerm)
+	cl.Sim.AddInvariant(CommitNotBehindApplied)
+	cl.Sim.Start()
+	return cl
+}
+
+func Build(cfg sim.Config, ids []raft.NodeID, cfgs map[raft.NodeID]*config.Config, clients [][]string) *Cluster {
 	nodesMap := map[int]raft.NodeID{}
 	nodesInt := map[raft.NodeID]int{}
-	simNodes := make([]int, len(ids))
+	servers := make([]int, len(ids))
 
 	for id, nodeID := range ids {
 		nodesMap[id] = nodeID
 		nodesInt[nodeID] = id
-		simNodes[id] = id
+		servers[id] = id
 	}
 
-	drivers := map[int]*driver{}
+	clientIDs := make([]int, len(clients))
+	for i := range clients {
+		clientIDs[i] = len(ids) + i
+	}
+	all := append(append([]int{}, servers...), clientIDs...)
 
-	factory := func() sim.NodeFactory {
-		return func(id int) sim.Handler {
-			nodeConfig := cfgs[nodesMap[id]]
-			d := &driver{
-				turn:     &sim.Turn{},
-				cfg:      nodeConfig,
+	c := &Cluster{NodesInt: nodesInt, Servers: servers, Clients: clientIDs}
+
+	factory := func(id int) sim.Handler {
+		if id >= len(ids) {
+			return &clientDriver{
+				id:       id,
+				servers:  servers,
 				ids:      nodesInt,
-				nodesMap: nodesMap,
+				commands: clients[id-len(ids)],
+				history:  c.Sim.History(),
 			}
-			drivers[id] = d
-			return d
+		}
+		return &driver{
+			turn:     &sim.Turn{},
+			cfg:      cfgs[nodesMap[id]],
+			ids:      nodesInt,
+			nodesMap: nodesMap,
 		}
 	}
 
-	s := sim.New(cfg, simNodes, factory())
-
-	c := &Cluster{
-		Sim:      s,
-		NodesInt: nodesInt,
-		Nodes:    make([]*driver, len(ids)),
-		NodesMap: map[raft.NodeID]*driver{},
-	}
-	for i, nodeID := range ids {
-		c.Nodes[i] = drivers[i]
-		c.NodesMap[nodeID] = drivers[i]
-	}
+	c.Sim = sim.New(cfg, all, factory)
 	return c
 }
 
-type clusterOpts struct {
+type ClusterOpts struct {
 	Seed    uint64
 	Nodes   []raft.NodeID
 	Network sim.NetworkConfig
 	Until   sim.Time
+	Clients [][]string
 }
 
-func defaultOpts(seed uint64) clusterOpts {
-	return clusterOpts{
+func DefaultOpts(seed uint64) ClusterOpts {
+	return ClusterOpts{
 		Seed:  seed,
 		Nodes: []raft.NodeID{"node1", "node2", "node3"},
 		Network: sim.NetworkConfig{
@@ -85,7 +104,7 @@ func defaultOpts(seed uint64) clusterOpts {
 }
 
 // nodeConfigs builds one config per node; Nodes holds the peers.
-func nodeConfigs(ids []raft.NodeID) map[raft.NodeID]*config.Config {
+func NodeConfigs(ids []raft.NodeID) map[raft.NodeID]*config.Config {
 	out := map[raft.NodeID]*config.Config{}
 	for _, n := range ids {
 		peers := map[string]string{}
@@ -107,23 +126,62 @@ func nodeConfigs(ids []raft.NodeID) map[raft.NodeID]*config.Config {
 	return out
 }
 
-// buildCluster builds the cluster, adds the safety invariants, and starts it.
-func buildCluster(t *testing.T, opts clusterOpts) *Cluster {
-	t.Helper()
+// RunUntilAcks steps until n client operations are acked, or deadline passes.
+func (c *Cluster) RunUntilAcks(n int, deadline sim.Time) error {
+	for c.Sim.Now() < deadline {
+		if err := c.Sim.Step(100); err != nil {
+			return err
+		}
+		if ok, _, _ := c.Sim.History().Counts(); ok >= n {
+			return nil
+		}
+	}
+	ok, _, _ := c.Sim.History().Counts()
+	return fmt.Errorf("want %d acks by %d, got %d", n, deadline, ok)
+}
 
-	simCfg := sim.Config{
-		Seed:          opts.Seed,
-		MaxEvents:     1_000_000,
-		TraceLevel:    sim.TraceHashEventsAndState,
-		TraceKeep:     sim.KeepAll,
-		NetworkConfig: opts.Network,
+// CheckLogs fails if the server's logs differ, or if a write is missing
+// or appears a different number of times than it was sent.
+func (c *Cluster) CheckLogs(writes []string) error {
+	want := map[string]int{}
+	for _, w := range writes {
+		want[w]++
 	}
 
-	cl := Build(simCfg, opts.Nodes, nodeConfigs(opts.Nodes))
-	cl.Sim.AddInvariant(OneLeaderPerTerm)
-	cl.Sim.AddInvariant(CommitNotBehindApplied)
-	cl.Sim.Start()
-	return cl
+	var ref []string
+	for _, id := range c.Servers {
+		d := c.Sim.Handler(id).(*driver)
+		got := []string{}
+		count := map[string]int{}
+		for _, e := range d.logEntries(c.Sim.ReadCtx(id)) {
+			got = append(got, e.Command)
+			count[e.Command]++
+		}
+		for w, n := range want {
+			if count[w] != n {
+				return fmt.Errorf("node %d log %v has %q %d times, want %d", id, got, w, count[w], n)
+			}
+		}
+		if ref == nil {
+			ref = got
+			continue
+		}
+		if !slices.Equal(got, ref) {
+			return fmt.Errorf("node %d log %v, want %v", id, got, ref)
+		}
+	}
+	return nil
+}
+
+// CheckApplied fails if any server's state machine has a different value for key.
+func (c *Cluster) CheckApplied(key, want string) error {
+	for _, id := range c.Servers {
+		b, ok := c.Sim.Get(id, prefixSM+key)
+		if !ok || string(b) != want {
+			return fmt.Errorf("node %d: %s = %q (found=%v), want %q", id, key, b, ok, want)
+		}
+	}
+	return nil
 }
 
 // runUntilLeader runs until some node is leader, or the deadline passes.

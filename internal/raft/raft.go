@@ -327,6 +327,7 @@ func (r *Raft) onHeartbeat() {
 
 func (r *Raft) becomeLeader(ctx context.Context) {
 	r.changeRole(raftpb.Role_LEADER)
+	r.setLeader(r.config.ID)
 	if err := r.initLeaderState(ctx); err != nil {
 		slog.Error("failed to init leader state", "error", err)
 		r.changeRole(raftpb.Role_FOLLOWER)
