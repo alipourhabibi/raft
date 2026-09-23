@@ -32,6 +32,9 @@ $(OUT_DIR)/%.pb.go $(OUT_DIR)/%_grpc.pb.go: $(PROTO_DIR)/%.proto
 clean:
 	rm -rf $(OUT_DIR)/*
 
+mermaid:
+	mmdc -i out.mmd -o trace.pdf --pdfFit
+
 install-tools:
 	@echo "Installing/updating required protoc plugins..."
 	@go install google.golang.org/protobuf/cmd/protoc-gen-go@latest

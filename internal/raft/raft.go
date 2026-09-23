@@ -19,6 +19,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+var ErrEntryLost = errors.New("entry was replaced by another leader")
+
 type NodeID string
 
 type Message interface {
@@ -102,6 +104,7 @@ type envelope struct {
 
 type commitWaiter struct {
 	index    uint64
+	term     uint64 // term of the entry we appended; index+term identifies it
 	deadline uint64 // logical ms
 	done     func(error)
 }
@@ -285,7 +288,7 @@ func (r *Raft) Step(ctx context.Context, from NodeID, msg Message) error {
 // Tick moves logical time
 func (r *Raft) Tick(ctx context.Context) {
 	r.now += r.config.TickInterval
-	r.checkWaiters()
+	r.checkWaiters(ctx)
 
 	role := r.getRole()
 	switch role {
@@ -360,9 +363,9 @@ func (r *Raft) initLeaderState(ctx context.Context) error {
 	return nil
 }
 
-func (r *Raft) setCommitIndex(index uint64) {
+func (r *Raft) setCommitIndex(ctx context.Context, index uint64) {
 	r.commitIndex = index
-	r.checkWaiters()
+	r.checkWaiters(ctx)
 }
 
 // RequestVote handles the call from candidate
@@ -519,7 +522,7 @@ func (r *Raft) AppendEntries(ctx context.Context, from NodeID, msg AppendEntries
 		commitUpTo := min(msg.LeaderCommit, lastNewIndex)
 		currentCommit := r.commitIndex
 		if commitUpTo > currentCommit {
-			r.setCommitIndex(commitUpTo)
+			r.setCommitIndex(ctx, commitUpTo)
 			if err = r.applyCommitted(ctx); err != nil {
 				return err
 			}
@@ -879,7 +882,7 @@ func (r *Raft) commitNoOpEntry(ctx context.Context, done func(error)) {
 	}
 
 	entryIndex := lastLogIndex + 1
-	r.waitForCommit(entryIndex, func(err error) {
+	r.waitForCommit(entryIndex, term, func(err error) {
 		if err != nil {
 			done(err)
 			return
@@ -1031,7 +1034,7 @@ func (r *Raft) tryAdvanceCommitIndex(ctx context.Context) (err error) {
 		}
 
 		if r.quorumReached(replicatedOn) {
-			r.setCommitIndex(n)
+			r.setCommitIndex(ctx, n)
 			return r.applyCommitted(ctx)
 		}
 	}
@@ -1091,7 +1094,14 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest, reply func
 	}
 
 	entryIndex := lastLogIndex + 1
-	r.waitForCommit(entryIndex, func(err error) {
+	r.waitForCommit(entryIndex, term, func(err error) {
+		if errors.Is(err, ErrEntryLost) {
+			reply(&raftpb.SubmitResponse{
+				Success:  false,
+				LeaderId: r.getLastKnownLeader(),
+			}, nil)
+			return
+		}
 		if err != nil {
 			reply(nil, err)
 			return
@@ -1206,7 +1216,7 @@ func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest, 
 	// Wait for phase-1 to commit.  Phase-2 is triggered automatically by
 	// applyEntry once the joint entry is applied.
 	jointIndex := lastIdx + 1
-	r.waitForCommit(jointIndex, func(err error) {
+	r.waitForCommit(jointIndex, term, func(err error) {
 		if err != nil {
 			reply(nil, fmt.Errorf("wait for C_old,new commit: %w", err))
 			return
@@ -1215,17 +1225,19 @@ func (r *Raft) ChangeNodes(ctx context.Context, req *raftpb.ChangeNodesRequest, 
 	})
 }
 
-// registers a waiter. done runs when commitIndex >= index, or after 5s.
-func (r *Raft) waitForCommit(index uint64, done func(error)) {
+// waitForCommit registers a waiter. done runs when the entry at index commits
+// (nil), when another leader replaced it (ErrEntryLost), or after 5s (timeout).
+func (r *Raft) waitForCommit(index, term uint64, done func(error)) {
 	r.waiters = append(r.waiters, commitWaiter{
 		index:    index,
+		term:     term,
 		deadline: r.now + 5000, // timeout so the client doesn't wait forever
 		done:     done,
 	})
 }
 
 // checkWaiters runs when commitIndex changes and on every Tick.
-func (r *Raft) checkWaiters() {
+func (r *Raft) checkWaiters(ctx context.Context) {
 	type fire struct {
 		done func(error)
 		err  error
@@ -1236,7 +1248,18 @@ func (r *Raft) checkWaiters() {
 	for _, w := range r.waiters {
 		switch {
 		case r.commitIndex >= w.index:
-			fired = append(fired, fire{done: w.done})
+			// something at this index committed: is it still our entry?
+			entry, err := r.repository.GetEntryAtIndex(ctx, w.index)
+			switch {
+			case err != nil:
+				fired = append(fired, fire{done: w.done, err: err})
+			case entry.Term != w.term:
+				// a new leader overwrote this index. The client's write
+				// is gone, saying "success" here would be a lie.
+				fired = append(fired, fire{done: w.done, err: ErrEntryLost})
+			default:
+				fired = append(fired, fire{done: w.done})
+			}
 		case r.now >= w.deadline:
 			fired = append(fired, fire{done: w.done, err: fmt.Errorf("timed out waiting for index %d to commit", w.index)})
 		default:

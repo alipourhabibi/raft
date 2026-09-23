@@ -87,7 +87,7 @@ type ClusterOpts struct {
 func DefaultOpts(seed uint64) ClusterOpts {
 	return ClusterOpts{
 		Seed:  seed,
-		Nodes: []raft.NodeID{"node1", "node2", "node3"},
+		Nodes: []raft.NodeID{"node0", "node1", "node2"},
 		Network: sim.NetworkConfig{
 			Delay: sim.DelaySpec{
 				Kind:   sim.DelayUniform,

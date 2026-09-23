@@ -218,3 +218,33 @@ func (c *clientDriver) StateString(_ *sim.Ctx) string {
 	return fmt.Sprintf("client next=%d/%d pending=%v target=%d",
 		c.next, len(c.commands), c.pending, c.target)
 }
+
+func (m ClientSubmit) String() string {
+	return fmt.Sprintf("SUBMIT serial=%s cmd=%q", m.Serial, m.Command)
+}
+
+func (m ClientSubmitResp) String() string {
+	s := fmt.Sprintf("SUBMIT-resp serial=%s ok=%v", m.Serial, m.Success)
+	if m.LeaderID != "" {
+		s += " leader=" + m.LeaderID
+	}
+	if m.Err != "" {
+		s += " err=" + m.Err
+	}
+	return s
+}
+
+func (m ClientGet) String() string {
+	return fmt.Sprintf("GET serial=%s cmd=%q", m.Serial, m.Command)
+}
+
+func (m ClientGetResp) String() string {
+	s := fmt.Sprintf("GET-resp serial=%s ok=%v value=%q", m.Serial, m.Status, m.Value)
+	if m.LeaderID != "" {
+		s += " leader=" + m.LeaderID
+	}
+	if m.Err != "" {
+		s += " err=" + m.Err
+	}
+	return s
+}

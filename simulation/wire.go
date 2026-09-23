@@ -148,3 +148,23 @@ func entriesEqual(a, b []*raftpb.Entry) bool {
 	}
 	return true
 }
+
+func (w wire) String() string {
+	switch m := w.msg.(type) {
+	case raft.RequestVoteRequest:
+		return fmt.Sprintf("RequestVote term=%d candidate=%s lastIndex=%d lastTerm=%d",
+			m.Term, m.CandidateID, m.LastLogIndex, m.LastLogTerm)
+
+	case raft.RequestVoteResponse:
+		return fmt.Sprintf("RequestVote-resp term=%d granted=%v", m.Term, m.Granted)
+
+	case raft.AppendEntriesRequest:
+		return fmt.Sprintf("AppendEntries term=%d prevIndex=%d prevTerm=%d entries=%d commit=%d seq=%d",
+			m.Term, m.PrevLogIndex, m.PrevLogTerm, len(m.Entries), m.LeaderCommit, m.Seq)
+
+	case raft.AppendEntriesResponse:
+		return fmt.Sprintf("AppendEntries-resp term=%d success=%v seq=%d",
+			m.Term, m.Success, m.Seq)
+	}
+	return fmt.Sprintf("%T", w.msg)
+}
