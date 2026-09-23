@@ -2,11 +2,37 @@ package simulation
 
 import (
 	"fmt"
+	"os"
 	"slices"
 	"testing"
 
 	"github.com/alipourhabibi/detsim/sim"
 )
+
+func dump(t *testing.T, cl *Cluster) {
+	t.Helper()
+	t.Logf("states:\n%s", cl.Sim.StatesString())
+	if err := cl.Sim.Trace().Lanes(os.Stderr, cl.Sim.Nodes()); err != nil {
+		t.Logf("trace dump failed: %v", err)
+	}
+}
+
+// runUntilLeader runs until some node is leader, or the deadline passes.
+func runUntilLeader(t *testing.T, cl *Cluster, deadline sim.Time) {
+	t.Helper()
+	for cl.Sim.Now() < deadline {
+		if err := cl.Sim.Step(100); err != nil {
+			dump(t, cl)
+			t.Fatalf("invariant broken: %v", err)
+		}
+		// a legal old leader in an older term never fails the test.
+		if leaderCount(cl) >= 1 {
+			return
+		}
+	}
+	dump(t, cl)
+	t.Fatal("no leader before deadline")
+}
 
 func TestElectsOneLeader(t *testing.T) {
 	cl := New(DefaultOpts(1))

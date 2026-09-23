@@ -2,9 +2,7 @@ package simulation
 
 import (
 	"fmt"
-	"os"
 	"slices"
-	"testing"
 
 	"github.com/alipourhabibi/detsim/sim"
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
@@ -32,6 +30,7 @@ func New(opts ClusterOpts) *Cluster {
 	cl := Build(simCfg, opts.Nodes, NodeConfigs(opts.Nodes), opts.Clients)
 	cl.Sim.AddInvariant(OneLeaderPerTerm)
 	cl.Sim.AddInvariant(CommitNotBehindApplied)
+	cl.Sim.AddInvariant(CommittedPrefixesAgree)
 	cl.Sim.Start()
 	return cl
 }
@@ -140,65 +139,79 @@ func (c *Cluster) RunUntilAcks(n int, deadline sim.Time) error {
 	return fmt.Errorf("want %d acks by %d, got %d", n, deadline, ok)
 }
 
-// CheckLogs fails if the server's logs differ, or if a write is missing
-// or appears a different number of times than it was sent.
-func (c *Cluster) CheckLogs(writes []string) error {
-	want := map[string]int{}
+// CheckWritesCommitted checks acked writes are committed.
+// everywhere=false: on at least one node (true at any moment).
+// everywhere=true:  on every node (only after healing).
+func (c *Cluster) CheckWritesCommitted(writes []string, everywhere bool) error {
+	logs := committedLogs(c.Sim)
 	for _, w := range writes {
-		want[w]++
-	}
-
-	var ref []string
-	for _, id := range c.Servers {
-		d := c.Sim.Handler(id).(*driver)
-		got := []string{}
-		count := map[string]int{}
-		for _, e := range d.logEntries(c.Sim.ReadCtx(id)) {
-			got = append(got, e.Command)
-			count[e.Command]++
-		}
-		for w := range want {
-			if count[w] == 0 { // a retry may append twice; apply skips it
-				return fmt.Errorf("node %d log %v has no %q", id, got, w)
+		found := 0
+		for _, l := range logs {
+			got := commands(l.committed)
+			if slices.Contains(got, w) {
+				found++
+			} else if everywhere {
+				return fmt.Errorf("write %q not committed on node %d (log %v)", w, l.id, got)
 			}
 		}
-		if ref == nil {
-			ref = got
-			continue
-		}
-		if !slices.Equal(got, ref) {
-			return fmt.Errorf("node %d log %v, want %v", id, got, ref)
+		if found == 0 {
+			return fmt.Errorf("acked write %q is not committed on any node", w)
 		}
 	}
 	return nil
 }
 
-// CheckApplied fails if any server's state machine has a different value for key.
-func (c *Cluster) CheckApplied(key, want string) error {
+// CheckStateMachineApplied checks every live server's state machine has value
+// we want for key. This is liveness: true only after healing and a catch-up window.
+func (c *Cluster) CheckStateMachineApplied(key, want string) error {
 	for _, id := range c.Servers {
+		if !c.Sim.Up(id) {
+			continue // crashed: its state is frozen, not wrong
+		}
 		b, ok := c.Sim.Get(id, prefixSM+key)
-		if !ok || string(b) != want {
-			return fmt.Errorf("node %d: %s = %q (found=%v), want %q", id, key, b, ok, want)
+		if !ok {
+			return fmt.Errorf("node %d: %s is missing, want %q", id, key, want)
+		}
+		if string(b) != want {
+			return fmt.Errorf("node %d: %s = %q, want %q", id, key, b, want)
 		}
 	}
 	return nil
 }
 
-// runUntilLeader runs until some node is leader, or the deadline passes.
-func runUntilLeader(t *testing.T, cl *Cluster, deadline sim.Time) {
-	t.Helper()
-	for cl.Sim.Now() < deadline {
-		if err := cl.Sim.Step(100); err != nil {
-			dump(t, cl)
-			t.Fatalf("invariant broken: %v", err)
+type nodeLog struct {
+	id        int
+	committed []*raftpb.Entry // entries 1..commitIndex
+}
+
+// committedLogs reads the committed part of every live raft node's log.
+func committedLogs(s *sim.Sim) []nodeLog {
+	var logs []nodeLog
+	for _, id := range s.Nodes() {
+		if !s.Up(id) {
+			continue // crashed: nothing to read
 		}
-		// a legal old leader in an older term never fails the test.
-		if leaderCount(cl) >= 1 {
-			return
+		d, ok := s.Handler(id).(*driver)
+		if !ok {
+			continue // a client node
 		}
+
+		snap := d.snapshot(s.ReadCtx(id))
+		entries := d.logEntries(s.ReadCtx(id)) // entries[0] is log index 1
+
+		n := min(int(snap.CommitIndex), len(entries))
+		logs = append(logs, nodeLog{id: id, committed: entries[:n]})
 	}
-	dump(t, cl)
-	t.Fatal("no leader before deadline")
+	return logs
+}
+
+// commands is the command text of entries, for messages and simple checks.
+func commands(entries []*raftpb.Entry) []string {
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.Command
+	}
+	return out
 }
 
 // leaderCount counts the live nodes that believe they are leader.
@@ -210,12 +223,4 @@ func leaderCount(cl *Cluster) int {
 		}
 	}
 	return n
-}
-
-func dump(t *testing.T, cl *Cluster) {
-	t.Helper()
-	t.Logf("states:\n%s", cl.Sim.StatesString())
-	if err := cl.Sim.Trace().Lanes(os.Stderr, cl.Sim.Nodes()); err != nil {
-		t.Logf("trace dump failed: %v", err)
-	}
 }

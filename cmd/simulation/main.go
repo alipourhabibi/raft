@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/alipourhabibi/detsim/sim"
@@ -59,10 +61,6 @@ func check(cl *simulation.Cluster, commands []string, until sim.Time) error {
 	if err := cl.RunUntilAcks(len(commands), until); err != nil {
 		return err
 	}
-	// followers catch up
-	if err := cl.Sim.RunUntil(cl.Sim.Now() + 500); err != nil {
-		return err
-	}
 
 	var writes []string
 	last := map[string]string{}
@@ -73,12 +71,26 @@ func check(cl *simulation.Cluster, commands []string, until sim.Time) error {
 			last[f[1]] = f[2]
 		}
 	}
-	if err := cl.CheckLogs(writes); err != nil {
+
+	// safety: every write the client was told "success" for is really
+	// committed somewhere. An ack must never be taken back.
+	if err := cl.CheckWritesCommitted(writes, false); err != nil {
+		return fmt.Errorf("before heal: %w", err)
+	}
+
+	// heal, and let everyone catch up
+	if err := cl.Sim.RunHealed(sim.Duration(500)); err != nil {
 		return err
 	}
-	for k, v := range last {
-		if err := cl.CheckApplied(k, v); err != nil {
-			return err
+
+	// liveness: now every node must have it all
+	if err := cl.CheckWritesCommitted(writes, true); err != nil {
+		return fmt.Errorf("after heal: %w", err)
+	}
+
+	for _, k := range slices.Sorted(maps.Keys(last)) {
+		if err := cl.CheckStateMachineApplied(k, last[k]); err != nil {
+			return fmt.Errorf("after heal: %w", err)
 		}
 	}
 	return nil
