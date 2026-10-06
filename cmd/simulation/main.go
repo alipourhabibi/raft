@@ -79,7 +79,7 @@ func check(cl *simulation.Cluster, commands []string, until sim.Time) error {
 	}
 
 	// heal, and let everyone catch up
-	if err := cl.Sim.RunHealed(sim.Duration(500)); err != nil {
+	if err := cl.Sim.RunHealed(sim.Duration(3000)); err != nil {
 		return err
 	}
 
@@ -102,7 +102,10 @@ func printTrace(cl *simulation.Cluster, kind string) {
 	case "lanes":
 		err = cl.Sim.Trace().Lanes(os.Stdout, cl.Sim.Nodes())
 	case "mermaid":
-		err = cl.Sim.Trace().Mermaid(os.Stdout, cl.Sim.Nodes())
+		err = cl.Sim.Trace().Mermaid(os.Stdout, cl.Sim.Nodes(), sim.MermaidOpts{
+			SpanTimer: "lease",
+			Anchor:    cl.Sim.Nodes()[0], // Add the timer data on the node 0
+		})
 	case "none":
 	default:
 		err = fmt.Errorf("unknown trace %q", kind)
