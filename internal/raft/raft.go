@@ -273,7 +273,7 @@ func (r *Raft) Step(ctx context.Context, from NodeID, msg Message) error {
 	case SubmitRequest:
 		r.Submit(ctx, m.Req, m.Reply)
 	case GetRequest:
-		m.Reply(r.Get(ctx, m.Req))
+		r.Get(ctx, m.Req, m.Reply)
 	case ChangeNodesRequest:
 		r.ChangeNodes(ctx, m.Req, m.Reply)
 	default:
@@ -1120,33 +1120,81 @@ func (r *Raft) Submit(ctx context.Context, req *raftpb.SubmitRequest, reply func
 	})
 }
 
-// Get is used to do a read operation on the state machine
-func (r *Raft) Get(ctx context.Context, req *raftpb.GetRequest) (*raftpb.GetResponse, error) {
+// Get is used to do a read operation on the state machine.
+// the read goes through the log like a write: we append a no-op entry and
+// answer only after it is committed. a commit in our term needs a majority,
+// so we know we are still the leader and every write acked before this read
+// is applied by then.
+// answering from the state machine right away gives stale data in two cases
+// (raft paper §8):
+//   - a new leader does not know what is committed yet, its commitIndex is 0
+//     after a restart (sim seed 972)
+//   - an old leader cut off from the others does not know there is a newer
+//     leader with newer writes
+//
+// NOTE this is the simple way and it is slow: every read is a log entry and
+// a disk write. ReadIndex (Ongaro thesis §6.4) does the same with only a
+// heartbeat round to a majority, switch to it if reads matter.
+func (r *Raft) Get(ctx context.Context, req *raftpb.GetRequest, reply func(*raftpb.GetResponse, error)) {
 	if req.Command == "" {
-		return nil, status.Error(codes.InvalidArgument, "Command not provided")
+		reply(nil, status.Error(codes.InvalidArgument, "Command not provided"))
+		return
 	}
 
-	role := r.getRole()
-	if role != raftpb.Role_LEADER {
-		return &raftpb.GetResponse{
+	notLeader := func() {
+		reply(&raftpb.GetResponse{
 			Status:   false,
 			LeaderId: r.getLastKnownLeader(),
-		}, nil
+		}, nil)
+	}
+	if r.getRole() != raftpb.Role_LEADER {
+		notLeader()
+		return
 	}
 
-	if err := r.sendHeartbeat(ctx); err != nil {
-		return nil, err
-	}
-
-	data, err := r.stateMachine.Get(ctx, req.Command)
+	term, err := r.repository.GetCurrentTerm(ctx)
 	if err != nil {
-		return nil, err
+		reply(nil, err)
+		return
+	}
+	lastLogIndex, err := r.repository.GetLastLogIndex(ctx)
+	if err != nil {
+		reply(nil, err)
+		return
+	}
+	entry := &raftpb.Entry{
+		Term:    term,
+		Command: "NO OP",
+		Type:    raftpb.EntryType_ENTRY_TYPE_COMMAND,
+	}
+	if err := r.repository.TruncateAndAppend(ctx, lastLogIndex, []*raftpb.Entry{entry}); err != nil {
+		reply(nil, err)
+		return
 	}
 
-	return &raftpb.GetResponse{
-		Status: true,
-		Value:  data,
-	}, nil
+	r.waitForCommit(lastLogIndex+1, term, func(err error) {
+		// another leader took this index, so we are not the leader anymore
+		if errors.Is(err, ErrEntryLost) {
+			notLeader()
+			return
+		}
+		if err != nil {
+			reply(nil, err)
+			return
+		}
+		// waiters run as soon as commitIndex moves and before the apply, so
+		// apply here first or the read misses the last writes
+		if err := r.applyCommitted(ctx); err != nil {
+			reply(nil, err)
+			return
+		}
+		data, err := r.stateMachine.Get(ctx, req.Command)
+		if err != nil {
+			reply(nil, err)
+			return
+		}
+		reply(&raftpb.GetResponse{Status: true, Value: data}, nil)
+	})
 }
 
 // ChangeNodes initiates a joint-consensus membership change.

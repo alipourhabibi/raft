@@ -16,3 +16,7 @@ version 2
 	t=8834 heal all
 	t=8932 node 2 paused; duration: 233
 	t=9338 node 0 paused; duration: 142
+972	stale read: GET Y at t=1645 returned "c1.5", but "c0.0" was acked at t=1172
+	t=167 node 0 crashed; wipe disk: false; downtime: 892
+	t=782 node 2 paused; duration: 360
+	t=1180 node 2 crashed; wipe disk: false; downtime: 389

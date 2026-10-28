@@ -36,7 +36,14 @@ func newNode(t *testing.T) *Raft {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := NewRaftService(memory.NewMemoryDB(cfg), cfg, sm, nopTransport{}, zeroRand{})
+	db := memory.NewMemoryDB(cfg)
+	// NewMemoryDB starts with the peers only, without a itself, and raft
+	// trusts a stored config, so set the whole cluster
+	all := &raftpb.ClusterConfig{Nodes: map[string]string{"a": "a", "b": "b", "c": "c"}}
+	if err := db.SetClusterConfig(ctx, all); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewRaftService(db, cfg, sm, nopTransport{}, zeroRand{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,5 +79,62 @@ func TestLeaderStepsDownOnHigherTermVote(t *testing.T) {
 	}
 	if role := r.getRole(); role != raftpb.Role_FOLLOWER {
 		t.Fatalf("role = %v after a term 6 vote request, want FOLLOWER", role)
+	}
+}
+
+// a leader must not answer a read before an entry of its own term commits:
+// a new leader may not have applied what is already committed, and an old
+// one cut off from the others doesn't know a newer leader exists. Here the
+// peers never answer, so nothing can commit and the read must wait.
+func TestReadWaitsForQuorum(t *testing.T) {
+	r := newNode(t)
+	makeLeader(t, r, 4)
+
+	replied := false
+	err := r.Step(context.Background(), "", GetRequest{
+		Req: &raftpb.GetRequest{Command: "GET X"},
+		Reply: func(resp *raftpb.GetResponse, err error) {
+			replied = err == nil && resp.Status
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replied {
+		t.Fatal("leader answered a read with no quorum")
+	}
+}
+
+// the read is answered once its no-op entry is committed by a majority
+func TestReadAnsweredAfterQuorum(t *testing.T) {
+	ctx := context.Background()
+	r := newNode(t)
+	makeLeader(t, r, 4)
+
+	var got *raftpb.GetResponse
+	err := r.Step(ctx, "", GetRequest{
+		Req:   &raftpb.GetRequest{Command: "GET X"},
+		Reply: func(resp *raftpb.GetResponse, err error) { got = resp },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatal("answered before anything was committed")
+	}
+	if last, _ := r.repository.GetLastLogIndex(ctx); last != 2 {
+		t.Fatalf("log has %d entries, want 2: the leader's entry and the read's no-op", last)
+	}
+
+	// send both entries to b and let it answer, with a that is 2 of 3
+	if err := r.sendHeartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sent := r.lastSent["b"]
+	if err := r.Step(ctx, "b", AppendEntriesResponse{Term: 4, Success: true, Seq: sent.seq}); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || !got.Status {
+		t.Fatalf("read not answered after a majority has its entry: %v", got)
 	}
 }
