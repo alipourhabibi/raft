@@ -1,0 +1,18 @@
+version 2
+# raft simulation, workload v1
+# flags:
+
+261	invariant broken at t=9497 #3339: two leaders in term 14: node0 and node1
+	t=1728 isolate 2
+	t=1890 heal all
+	t=4020 node 1 crashed; wipe disk: false; downtime: 700
+	t=4239 isolate 2
+	t=4504 heal all
+	t=4715 partition [0]|[1 2]
+	t=4850 heal all
+	t=5365 node 2 crashed; wipe disk: false; downtime: 224
+	t=8418 isolate 0
+	t=8678 node 1 crashed; wipe disk: false; downtime: 214
+	t=8834 heal all
+	t=8932 node 2 paused; duration: 233
+	t=9338 node 0 paused; duration: 142

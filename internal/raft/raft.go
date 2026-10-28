@@ -405,6 +405,13 @@ func (r *Raft) RequestVote(ctx context.Context, from NodeID, msg RequestVoteRequ
 			return err
 		}
 		currentTerm = msg.Term
+		// A higher term ends whatever we were in the old one, even if we
+		// refuse this vote below. A leader that kept its role here would
+		// be leader of a term it never won, next to the real one.
+		if r.getRole() != raftpb.Role_FOLLOWER {
+			r.changeRole(raftpb.Role_FOLLOWER)
+			r.resetElectionDeadline()
+		}
 	}
 
 	votedFor, err := r.repository.GetVotedFor(ctx, msg.Term)
