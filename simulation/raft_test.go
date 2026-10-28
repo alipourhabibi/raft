@@ -2,12 +2,20 @@ package simulation
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"slices"
 	"testing"
 
 	"github.com/alipourhabibi/detsim/sim"
 )
+
+func TestMain(m *testing.M) {
+	// raft logs routine events, thousands per seed; they bury test output
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	os.Exit(m.Run())
+}
 
 func dump(t *testing.T, cl *Cluster) {
 	t.Helper()
@@ -81,8 +89,9 @@ func TestReplicatesOneEntry(t *testing.T) {
 		t.Fatalf("invariant broken: %v", err)
 	}
 
-	// every node holds the same log, and each command appears exactly
-	// as many times as the client sent it
+	// every node holds the same log, and each command is there under as
+	// many different serials as the client sent it. A retry can append the
+	// same serial twice, that is fine: apply skips the second one.
 	want := map[string]int{}
 	for _, c := range commands {
 		want[c]++
@@ -94,16 +103,19 @@ func TestReplicatesOneEntry(t *testing.T) {
 		entries := d.logEntries(cl.Sim.ReadCtx(id))
 
 		got := make([]string, 0, len(entries))
-		count := map[string]int{}
+		serials := map[string]map[string]bool{} // command -> its serials
 		for _, e := range entries {
 			got = append(got, e.Command)
-			count[e.Command]++
+			if serials[e.Command] == nil {
+				serials[e.Command] = map[string]bool{}
+			}
+			serials[e.Command][e.SerialNumber] = true
 		}
 
 		for c, n := range want {
-			if count[c] != n {
+			if len(serials[c]) != n {
 				dump(t, cl)
-				t.Fatalf("node %d log %v has %q %d times, want %d", id, got, c, count[c], n)
+				t.Fatalf("node %d log %v has %q under %d serials, want %d", id, got, c, len(serials[c]), n)
 			}
 		}
 
@@ -154,9 +166,9 @@ func TestReadAfterWrite(t *testing.T) {
 		dump(t, cl)
 		t.Fatal("no completed read")
 	}
-	if read.Value != "2" {
+	if got := read.Value.(OpInfo).Result; got != "2" {
 		dump(t, cl)
-		t.Fatalf("GET X returned %v, want \"2\"", read.Value)
+		t.Fatalf("GET X returned %q, want \"2\"", got)
 	}
 
 	// give followers time to apply
@@ -172,5 +184,34 @@ func TestReadAfterWrite(t *testing.T) {
 			dump(t, cl)
 			t.Fatalf("node %d: X = %q (found=%v), want \"2\"", id, b, ok)
 		}
+	}
+}
+
+// faults on: crashes, pauses, partitions and lossy links on the servers,
+// every check after every seed. This is what found the two leaders in one
+// term and the stale reads.
+func TestFaultSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow")
+	}
+	// two clients writing the same key, so reads can be stale
+	clients := [][]string{
+		{"SET X a1", "GET X", "SET X a2", "GET X", "SET Y a", "GET X"},
+		{"SET X b1", "GET X", "SET X b2", "GET Y", "GET X"},
+	}
+	all := append(slices.Clone(clients[0]), clients[1]...)
+	// ponytail: 200 seeds keeps go test fast; the old code needed 325 for
+	// two leaders and 495 for a stale read, run cmd/simulation -n 1000 for those
+	f, _ := sim.Sweep(1, 201, FaultPlan([]int{0, 1, 2}, 10_000, 0), func(seed uint64) (*sim.Sim, *Cluster) {
+		opts := DefaultOpts(seed)
+		opts.Clients = clients
+		cl := Prepare(opts)
+		return cl.Sim, cl
+	}, func(_ *sim.Sim, cl *Cluster) error {
+		return cl.Check(all, 10_000)
+	})
+	if f != nil {
+		dump(t, f.Ctx)
+		t.Fatalf("seed %d: %v\nplan:\n%s", f.Seed, f.Err, f.Plan)
 	}
 }

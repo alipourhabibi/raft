@@ -15,7 +15,18 @@ const (
 	opSubmit     = "submit"
 	timerRetry   = "retry"
 	retryAfterMs = 200
+
+	keyClientInc  = "client/inc"  // how many times this client started
+	keyClientNext = "client/next" // index of the first command not yet acked
 )
+
+// OpInfo is the Value of a history op: what was sent, and for a read, what
+// came back.
+type OpInfo struct {
+	Serial string
+	Cmd    string
+	Result string // reads only
+}
 
 type ClientSubmit struct {
 	Serial  string
@@ -97,8 +108,10 @@ type clientDriver struct {
 	ids      map[raft.NodeID]int // raft id -> sim id, for redirects
 	commands []string
 	history  *sim.History
+	sim      *sim.Sim // history uses sim time, node clocks can be skewed
 
-	// volatile: a restarted client starts over from its first command
+	// next and inc are on disk, the rest is volatile
+	inc     uint64 // incarnation, part of every serial
 	next    int    // index into commands of the command in flight
 	target  int    // index into servers
 	pending bool   // a command is in flight
@@ -109,8 +122,16 @@ func (c *clientDriver) key() uint64 {
 	return uint64(c.next)
 }
 
+// OnRestart continues after the last acked command instead of starting over.
+// The serials carry the incarnation, so a command resent after a crash is a
+// new request: dedup can't ack it for an effect from before it was sent.
 func (c *clientDriver) OnRestart(ctx *sim.Ctx) {
-	c.next, c.target, c.pending = 0, 0, false
+	inc, _ := getU64(ctx, keyClientInc)
+	c.inc = inc + 1
+	next, _ := getU64(ctx, keyClientNext)
+	c.next, c.target, c.pending = int(next), 0, false
+	putU64(ctx, keyClientInc, c.inc)
+	ctx.Sync()
 	c.sendNext(ctx)
 }
 
@@ -135,14 +156,14 @@ func (c *clientDriver) sendNext(ctx *sim.Ctx) {
 		return // done
 	}
 	cmd := c.commands[c.next]
-	c.serial = fmt.Sprintf("c%d-%d", c.id, c.next)
+	c.serial = fmt.Sprintf("c%d.%d-%d", c.id, c.inc, c.next)
 	c.pending = true
 
 	kind := opSubmit
 	if isRead(cmd) {
 		kind = opGet
 	}
-	c.history.InvokeValue(ctx.Now(), c.id, kind, c.key(), cmd)
+	c.history.InvokeValue(c.sim.Now(), c.id, kind, c.key(), OpInfo{Serial: c.serial, Cmd: cmd})
 	c.send(ctx)
 }
 
@@ -158,15 +179,14 @@ func (c *clientDriver) send(ctx *sim.Ctx) {
 }
 
 func (c *clientDriver) OnMessage(ctx *sim.Ctx, from int, msg sim.Message) {
-	var serial, leaderID string
-	var success bool
-	var value any
+	var serial, leaderID, value string
+	var success, read bool
 
 	switch m := msg.(type) {
 	case ClientSubmitResp:
 		serial, success, leaderID = m.Serial, m.Success, m.LeaderID
 	case ClientGetResp:
-		serial, success, leaderID, value = m.Serial, m.Status, m.LeaderID, m.Value
+		serial, success, leaderID, value, read = m.Serial, m.Status, m.LeaderID, m.Value, true
 	default:
 		panic(fmt.Sprintf("client: unexpected %T", msg))
 	}
@@ -177,13 +197,16 @@ func (c *clientDriver) OnMessage(ctx *sim.Ctx, from int, msg sim.Message) {
 
 	switch {
 	case success:
-		if value != nil {
-			c.history.CompleteValue(ctx.Now(), c.id, c.key(), value)
+		if read {
+			info := OpInfo{Serial: c.serial, Cmd: c.commands[c.next], Result: value}
+			c.history.CompleteValue(c.sim.Now(), c.id, c.key(), info)
 		} else {
-			c.history.Complete(ctx.Now(), c.id, c.key())
+			c.history.Complete(c.sim.Now(), c.id, c.key())
 		}
 		c.pending = false
 		c.next++
+		putU64(ctx, keyClientNext, uint64(c.next))
+		ctx.Sync()
 		c.sendNext(ctx)
 
 	case leaderID != "":

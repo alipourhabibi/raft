@@ -13,6 +13,10 @@ import (
 	"github.com/alipourhabibi/raft/internal/statemachine"
 )
 
+// BuggifySkipSync drops the end of turn sync. Turn it on to see that the
+// sync before a reply is what keeps votes and acks safe across a crash.
+const BuggifySkipSync = "raft/skip-sync"
+
 type driver struct {
 	node *raft.Raft
 	turn *sim.Turn
@@ -80,6 +84,17 @@ func (d *driver) OnMessage(ctx *sim.Ctx, from int, msg sim.Message) {
 	if err := d.node.Step(context.Background(), raftFrom, raftMsg); err != nil {
 		panic(fmt.Sprintf("harness: node %s: %v", d.cfg.ID, err))
 	}
+	d.sync(ctx)
+}
+
+// sync makes this turn's writes durable. Raft must persist term, vote and
+// log before it replies, and every reply of this turn leaves only after the
+// callback returns, so one sync at the end covers all of them.
+func (d *driver) sync(ctx *sim.Ctx) {
+	if ctx.Buggify(BuggifySkipSync) {
+		return // reply with the writes still only in memory
+	}
+	ctx.Sync()
 }
 
 // submitRequest wraps a client write.
@@ -127,6 +142,7 @@ func (d *driver) OnTimer(ctx *sim.Ctx, name string) {
 
 	d.node.Tick(context.Background())
 	ctx.SetTimer(name, sim.Duration(d.cfg.TickInterval))
+	d.sync(ctx)
 }
 
 func (d *driver) OnRestart(ctx *sim.Ctx) {
@@ -150,6 +166,7 @@ func (d *driver) OnRestart(ctx *sim.Ctx) {
 	}
 	d.node = node
 	ctx.SetTimer("tick", sim.Duration(d.cfg.TickInterval))
+	d.sync(ctx)
 }
 
 func (d *driver) StateDigest(ctx *sim.Ctx, w io.Writer) {

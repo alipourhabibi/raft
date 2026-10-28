@@ -13,9 +13,7 @@ type smRepo struct {
 }
 
 func (r *smRepo) Set(_ context.Context, key, value string) error {
-	ctx := r.turn.Ctx()
-	ctx.Put(prefixSM+key, []byte(value))
-	ctx.Sync()
+	r.turn.Ctx().Put(prefixSM+key, []byte(value)) // synced by the driver
 	return nil
 }
 

@@ -590,7 +590,7 @@ func (r *Raft) handleRequestVoteResponse(ctx context.Context, from NodeID, msg R
 		}
 		r.changeRole(raftpb.Role_FOLLOWER)
 		r.resetElectionDeadline()
-		slog.Error("failed to start election", "error", "discovered higher term during election")
+		slog.Debug("lost election", "reason", "discovered higher term during election") // routine, not an error
 		return nil
 	}
 

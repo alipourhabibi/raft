@@ -28,11 +28,12 @@ func logKey(i uint64) string {
 	return fmt.Sprintf("%s%020d", prefixLog, i)
 }
 
+// Writes here are not synced. The driver syncs once at the end of each turn,
+// before any reply leaves; see driver.sync.
 func putU64(ctx *sim.Ctx, key string, v uint64) {
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], v)
 	ctx.Put(key, b[:])
-	ctx.Sync() // one fsync per write, for now
 }
 
 func getU64(ctx *sim.Ctx, key string) (uint64, bool) {
@@ -49,7 +50,6 @@ func putJSON(ctx *sim.Ctx, key string, v any) {
 		panic(fmt.Sprintf("harness: marshal %s: %v", key, err))
 	}
 	ctx.Put(key, b)
-	ctx.Sync()
 }
 
 func (s *store) GetCurrentTerm(_ context.Context) (uint64, error) {
@@ -79,9 +79,7 @@ func (s *store) GetVotedFor(_ context.Context, term uint64) (*string, error) {
 }
 
 func (s *store) VoteFor(_ context.Context, term uint64, node string) error {
-	ctx := s.turn.Ctx()
-	ctx.Put(fmt.Sprintf("%s%d", prefixVote, term), []byte(node))
-	ctx.Sync()
+	s.turn.Ctx().Put(fmt.Sprintf("%s%d", prefixVote, term), []byte(node))
 	return nil
 }
 
@@ -160,7 +158,6 @@ func (s *store) SetSerialNumber(_ context.Context, serialNumber string, status b
 		b[0] = 1
 	}
 	c.Put(prefixSerial+serialNumber, b[:])
-	c.Sync()
 	return nil
 }
 
