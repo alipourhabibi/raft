@@ -1,6 +1,7 @@
 package simulation
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -194,24 +195,54 @@ func TestFaultSweep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow")
 	}
-	// two clients writing the same key, so reads can be stale
-	clients := [][]string{
-		{"SET X a1", "GET X", "SET X a2", "GET X", "SET Y a", "GET X"},
-		{"SET X b1", "GET X", "SET X b2", "GET Y", "GET X"},
-	}
-	all := append(slices.Clone(clients[0]), clients[1]...)
-	// ponytail: 200 seeds keeps go test fast; the old code needed 325 for
-	// two leaders and 495 for a stale read, run cmd/simulation -n 1000 for those
-	f, _ := sim.Sweep(1, 201, FaultPlan([]int{0, 1, 2}, 10_000, 0), func(seed uint64) (*sim.Sim, *Cluster) {
+	// ponytail: 200 seeds keeps go test fast; a deep hunt is
+	// go run ./cmd/simulation, which sweeps 1000
+	f, _ := sim.Sweep(1, 201, FaultPlan(Servers, Until, 0), func(seed uint64) (*sim.Sim, *Cluster) {
 		opts := DefaultOpts(seed)
-		opts.Clients = clients
+		opts.Clients = Workload(seed)
 		cl := Prepare(opts)
 		return cl.Sim, cl
 	}, func(_ *sim.Sim, cl *Cluster) error {
-		return cl.Check(all, 10_000)
+		return cl.Check(Until)
 	})
 	if f != nil {
 		dump(t, f.Ctx)
 		t.Fatalf("seed %d: %v\nplan:\n%s", f.Seed, f.Err, f.Plan)
+	}
+}
+
+// TestCorpus replays every seed in testdata/corpus.txt with the plan saved
+// for it. Those are failures a sweep found: once fixed they must stay fixed.
+// Add to it with: go run ./cmd/simulation -corpus simulation/testdata/corpus.txt
+func TestCorpus(t *testing.T) {
+	f, err := os.Open("testdata/corpus.txt")
+	if errors.Is(err, os.ErrNotExist) {
+		t.Skip("no corpus yet")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := sim.LoadCorpus(f)
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, e := range entries {
+		t.Run(fmt.Sprintf("seed=%d", e.Seed), func(t *testing.T) {
+			t.Parallel()
+			plan := e.Plan
+			if plan == nil {
+				plan = FaultPlan(Servers, Until, 0)(e.Seed, sim.NewStream(e.Seed, sim.StreamFault))
+			}
+			opts := DefaultOpts(e.Seed)
+			opts.Clients = Workload(e.Seed)
+			cl := Prepare(opts)
+			cl.Sim.StartWith(plan)
+			if err := cl.Check(Until); err != nil {
+				t.Fatalf("still fails: %v\nfound as: %s\nreplay: go run ./cmd/simulation -seed %d",
+					err, e.Reason, e.Seed)
+			}
+		})
 	}
 }

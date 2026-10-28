@@ -18,8 +18,9 @@ type Cluster struct {
 	Sim      *sim.Sim
 	NodesInt map[raft.NodeID]int
 
-	Servers []int // sim ids of servers
-	Clients []int // sim ids of clients
+	Servers  []int      // sim ids of servers
+	Clients  []int      // sim ids of clients
+	Commands [][]string // each client's commands
 
 	memo *memo // what the invariants saw over the whole run
 }
@@ -43,6 +44,7 @@ func Prepare(opts ClusterOpts) *Cluster {
 	}
 
 	cl := Build(simCfg, opts.Nodes, NodeConfigs(opts.Nodes), opts.Clients)
+	cl.Commands = opts.Clients
 	cl.memo = newMemo()
 	cl.Sim.AddInvariant(cl.memo.check)
 	return cl
@@ -316,6 +318,12 @@ func leaderCount(cl *Cluster) int {
 	return n
 }
 
+// Until is how long a seed runs with faults before healing, in fake ms.
+const Until = 10_000
+
+// Servers are the sim ids of the servers in DefaultOpts.
+var Servers = []int{0, 1, 2}
+
 // noWipe turns disk wipes off. A voter that loses its disk can vote twice
 // and forget acked entries, raft is not meant to survive that, so every wipe
 // would be a known failure. WipeChance 0 can't say this: before detsim
@@ -350,7 +358,7 @@ func FaultPlan(servers []int, until sim.Time, buggifyPercent int) func(uint64, s
 //  3. heal everything, then liveness: every command gets acked
 //  4. every acked write is on every server, every server applied the last
 //     value of each key, and no read was stale
-func (c *Cluster) Check(commands []string, until sim.Time) error {
+func (c *Cluster) Check(until sim.Time) error {
 	if err := c.Sim.RunUntil(until); err != nil {
 		return err
 	}
@@ -361,7 +369,11 @@ func (c *Cluster) Check(commands []string, until sim.Time) error {
 	if err := c.Sim.RunHealed(3000); err != nil {
 		return err
 	}
-	if err := c.RunUntilAcks(len(commands), c.Sim.Now()+20_000); err != nil {
+	total := 0
+	for _, cmds := range c.Commands {
+		total += len(cmds)
+	}
+	if err := c.RunUntilAcks(total, c.Sim.Now()+20_000); err != nil {
 		return fmt.Errorf("liveness: %w", err)
 	}
 	// a few heartbeats so followers learn the last commit
