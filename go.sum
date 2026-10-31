@@ -1,5 +1,5 @@
-github.com/alipourhabibi/detsim v0.0.0-20261006123338-1ee11e3c2abf h1:PKwSWu3UoyOQJlBKRUlTEuD7Mio62UEQp7txFY4iN0w=
-github.com/alipourhabibi/detsim v0.0.0-20261006123338-1ee11e3c2abf/go.mod h1:bpvUgvLT9GcbZiRuMgA6QzDOftK3Ge9h75xRfM+eESM=
+github.com/alipourhabibi/detsim v0.0.0-20261027130016-08aa84dc9002 h1:npUdJ6J6Iw0BSp4KfAiNnWYYPDnzx1eq5GGb049O3yo=
+github.com/alipourhabibi/detsim v0.0.0-20261027130016-08aa84dc9002/go.mod h1:bpvUgvLT9GcbZiRuMgA6QzDOftK3Ge9h75xRfM+eESM=
 github.com/bsm/ginkgo/v2 v2.12.0 h1:Ny8MWAHyOepLGlLKYmXG4IEkioBysk6GpaRTLC8zwWs=
 github.com/bsm/ginkgo/v2 v2.12.0/go.mod h1:SwYbGRRDovPVboqFv0tPTcG1sN61LM1Z4ARdbAV9g4c=
 github.com/bsm/gomega v1.27.10 h1:yeMWxP2pV2fG3FgAODIY8EiRE3dy0aeFYt4l7wh6yKA=

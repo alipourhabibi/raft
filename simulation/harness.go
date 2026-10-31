@@ -14,14 +14,27 @@ import (
 	"github.com/alipourhabibi/raft/internal/statemachine"
 )
 
-// BuggifySkipSync drops the end of turn sync. Turn it on to see that the
-// sync before a reply is what keeps votes and acks safe across a crash.
-const BuggifySkipSync = "raft/skip-sync"
+// Buggify points, turned on per seed with -buggify and -points.
+const (
+	// BuggifySkipSync drops the end of turn sync. Turn it on to see that the
+	// sync before a reply is what keeps votes and acks safe across a crash.
+	BuggifySkipSync = "raft/skip-sync"
+
+	// BuggifyCrashInWrite crashes the node just before a write to its log,
+	// term, vote or serials. A reply sent before the write it depends on
+	// would be out with the write lost.
+	BuggifyCrashInWrite = "raft/crash-in-write"
+
+	// BuggifyCrashMidAppend crashes the node between the trim and the append
+	// of TruncateAndAppend, like a crash between LTRIM and RPUSH in redis.
+	BuggifyCrashMidAppend = "raft/crash-mid-append"
+)
 
 type driver struct {
-	node *raft.Raft
-	turn *sim.Turn
-	mem  raftRepo.RaftRepository // nil: the sim disk, see ClusterOpts.Repo
+	node   *raft.Raft
+	turn   *sim.Turn
+	mem    raftRepo.RaftRepository // nil: the sim disk, see ClusterOpts.Repo
+	healed *bool                   // shared with the cluster, see store.crashPoint
 
 	// kept for OnRestart, which is where the node is built
 	cfg      *config.Config
@@ -156,7 +169,7 @@ func (d *driver) OnRestart(ctx *sim.Ctx) {
 		panic(fmt.Sprintf("harness: state machine: %v", err))
 	}
 
-	var repo raftRepo.RaftRepository = &store{d.turn}
+	var repo raftRepo.RaftRepository = &store{turn: d.turn, healed: d.healed}
 	if d.mem != nil {
 		repo = d.mem
 	}

@@ -41,11 +41,13 @@ var (
 	until   = flag.Int64("until", simulation.Until, "fake ms with faults, before healing")
 	cmds    = flag.String("cmds", "", "fixed commands instead of the per seed workload: comma separated, ; between clients")
 	faults  = flag.Bool("faults", true, "crash, pause and partition servers")
-	buggify = flag.Int("buggify", 0, "percent of seeds that skip the end of turn sync")
-	trace   = flag.String("trace", "lanes", "trace on failure: lanes, mermaid, none")
-	corpus  = flag.String("corpus", "", "file of failing seeds and their shrunk plans; failures are added to it")
-	rerun   = flag.Bool("rerun", false, "run only the seeds in -corpus")
-	repo    = flag.String("repo", "", `raft repository: "" for the sim disk, "memory" for the memory repo main.go uses (no crashes then, it keeps nothing across one)`)
+	buggify = flag.Int("buggify", 0, "percent of the -points each seed turns on")
+	points  = flag.String("points", simulation.BuggifySkipSync, "buggify points, comma separated: "+
+		simulation.BuggifySkipSync+", "+simulation.BuggifyCrashInWrite+", "+simulation.BuggifyCrashMidAppend)
+	trace  = flag.String("trace", "lanes", "trace on failure: lanes, mermaid, none")
+	corpus = flag.String("corpus", "", "file of failing seeds and their shrunk plans; failures are added to it")
+	rerun  = flag.Bool("rerun", false, "run only the seeds in -corpus")
+	repo   = flag.String("repo", "", `raft repository: "" for the sim disk, "memory" for the memory repo main.go uses (no crashes then, it keeps nothing across one)`)
 )
 
 func main() {
@@ -83,7 +85,8 @@ func gen(s uint64, r sim.Rand) *sim.Plan {
 	if !*faults {
 		return &sim.Plan{}
 	}
-	return simulation.FaultPlan(simulation.Servers, sim.Time(*until), *buggify, *repo != simulation.RepoMemory)(s, r)
+	return simulation.FaultPlan(simulation.Servers, sim.Time(*until), *buggify,
+		*repo != simulation.RepoMemory, strings.Split(*points, ",")...)(s, r)
 }
 
 func planFor(s uint64) *sim.Plan {

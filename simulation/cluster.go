@@ -3,7 +3,6 @@ package simulation
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
@@ -14,6 +13,7 @@ import (
 	"github.com/alipourhabibi/raft/internal/config"
 	"github.com/alipourhabibi/raft/internal/raft"
 	"github.com/alipourhabibi/raft/internal/repository/raft/memory"
+	"google.golang.org/protobuf/proto"
 )
 
 type Cluster struct {
@@ -32,6 +32,8 @@ type Cluster struct {
 
 	// Failover is how long the last CheckFailover took
 	Failover sim.Duration
+
+	healed bool // Check is past the fault phase, see store.crashPoint
 }
 
 // New builds and starts a cluster with no faults.
@@ -96,6 +98,7 @@ func Build(cfg sim.Config, ids []raft.NodeID, cfgs map[raft.NodeID]*config.Confi
 			}
 		}
 		d := &driver{
+			healed:   &c.healed,
 			turn:     &sim.Turn{},
 			cfg:      cfgs[nodesMap[id]],
 			ids:      nodesInt,
@@ -338,7 +341,7 @@ func durableLog(s *sim.Sim, id int) []*raftpb.Entry {
 			break
 		}
 		e := &raftpb.Entry{}
-		if err := json.Unmarshal(b, e); err != nil {
+		if err := proto.Unmarshal(b, e); err != nil {
 			panic(fmt.Sprintf("harness: node %d log %d: %v", id, i, err))
 		}
 		out = append(out, e)
@@ -363,31 +366,32 @@ const Until = 10_000
 // Servers are the sim ids of the servers in DefaultOpts.
 var Servers = []int{0, 1, 2}
 
-// noWipe turns disk wipes off. A voter that loses its disk can vote twice
-// and forget acked entries, raft is not meant to survive that, so every wipe
-// would be a known failure. WipeChance 0 can't say this: before detsim
-// c4813c2 it meant the default, 1 in 20.
-const noWipe = 1 << 62
-
 // FaultPlan makes the fault plan for one seed: crashes, pauses, partitions
 // and lossy links on the servers only, never more than one server down, so a
 // quorum is always possible. buggifyPercent > 0 also turns on BuggifySkipSync
 // for some seeds. crashes=false leaves crashes out, for the memory repo: it
 // keeps nothing across a restart, like the real process, so raft can't be
 // safe with it once a node crashes.
-func FaultPlan(servers []int, until sim.Time, buggifyPercent int, crashes bool) func(uint64, sim.Rand) *sim.Plan {
+//
+// points are the buggify points the seeds pick from, BuggifySkipSync if none.
+func FaultPlan(servers []int, until sim.Time, buggifyPercent int, crashes bool, points ...string) func(uint64, sim.Rand) *sim.Plan {
 	cfg := sim.PlanConfig{
-		Until:      until,
-		MeanGap:    300,
-		MaxDown:    1,
-		Weights:    sim.DefaultWeights(),
-		WipeChance: noWipe,
+		Until:   until,
+		MeanGap: 300,
+		MaxDown: 1,
+		Weights: sim.DefaultWeights(),
+		// no disk wipes: a voter that loses its disk can vote twice and
+		// forget acked entries, raft is not meant to survive that
+		WipeChance: 0,
 	}
 	if !crashes {
 		cfg.Weights.Crash = 0
 	}
 	if buggifyPercent > 0 {
-		cfg.Buggify = []string{BuggifySkipSync}
+		cfg.Buggify = points
+		if len(points) == 0 {
+			cfg.Buggify = []string{BuggifySkipSync}
+		}
 		cfg.BuggifyPercent = buggifyPercent
 	}
 	return func(seed uint64, r sim.Rand) *sim.Plan {
@@ -410,6 +414,7 @@ func (c *Cluster) Check(until sim.Time) error {
 		return fmt.Errorf("before heal: %w", err)
 	}
 
+	c.healed = true
 	if err := c.Sim.RunHealed(3000); err != nil {
 		return err
 	}
