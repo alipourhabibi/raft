@@ -125,6 +125,7 @@ type Raft struct {
 	lastKnownLeader string
 
 	lastHeartbeat uint64
+	heardLeader   bool // lastHeartbeat was set at least once
 
 	transport Transport
 	rng       Rand
@@ -378,11 +379,15 @@ func (r *Raft) RequestVote(ctx context.Context, from NodeID, msg RequestVoteRequ
 	// §6: if we've heard from a leader recently, reject the vote without
 	// updating our term. This prevents removed servers from disrupting
 	// the cluster by forcing leader re-elections.
-	// but this is not fully proved to be right and may cause bugs
-	minElectionTimeout := r.config.ElectionTimeoutEnd
+	// "recently" is the min election timeout, not the max: with the max a
+	// candidate that timed out early is refused by everyone and the failover
+	// takes about two timeouts (sim: median 483ms with 150-300ms timeouts).
+	// and only if we really heard a leader: a node that just started has
+	// lastHeartbeat 0 and now 0, which looked like a heartbeat right now.
+	minElectionTimeout := r.config.ElectionTimeoutStart
 	sinceHeartbeat := r.now - r.getHeartbeatTime()
 	slog.Debug("RequestVote", "last heartbeat", sinceHeartbeat, "min election timeout", minElectionTimeout)
-	if sinceHeartbeat < minElectionTimeout {
+	if r.heardLeader && sinceHeartbeat < minElectionTimeout {
 		r.transport.Send(ctx, from, RequestVoteResponse{
 			Term:    currentTerm,
 			Granted: false,
@@ -830,6 +835,7 @@ func (r *Raft) setHeartbeatTime() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.lastHeartbeat = r.now
+	r.heardLeader = true
 }
 
 // gets the heartbeat time in lock-free manner

@@ -36,14 +36,7 @@ func newNode(t *testing.T) *Raft {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db := memory.NewMemoryDB(cfg)
-	// NewMemoryDB starts with the peers only, without a itself, and raft
-	// trusts a stored config, so set the whole cluster
-	all := &raftpb.ClusterConfig{Nodes: map[string]string{"a": "a", "b": "b", "c": "c"}}
-	if err := db.SetClusterConfig(ctx, all); err != nil {
-		t.Fatal(err)
-	}
-	r, err := NewRaftService(db, cfg, sm, nopTransport{}, zeroRand{})
+	r, err := NewRaftService(memory.NewMemoryDB(cfg), cfg, sm, nopTransport{}, zeroRand{})
 	if err != nil {
 		t.Fatal(err)
 	}

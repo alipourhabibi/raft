@@ -23,7 +23,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/alipourhabibi/detsim/sim"
 	"github.com/alipourhabibi/raft/simulation"
@@ -43,6 +45,7 @@ var (
 	trace   = flag.String("trace", "lanes", "trace on failure: lanes, mermaid, none")
 	corpus  = flag.String("corpus", "", "file of failing seeds and their shrunk plans; failures are added to it")
 	rerun   = flag.Bool("rerun", false, "run only the seeds in -corpus")
+	repo    = flag.String("repo", "", `raft repository: "" for the sim disk, "memory" for the memory repo main.go uses (no crashes then, it keeps nothing across one)`)
 )
 
 func main() {
@@ -65,6 +68,7 @@ func opts(s uint64) simulation.ClusterOpts {
 	o.Network.LossPPM = uint32(*loss)
 	o.Network.DuplicationPPM = uint32(*dup)
 	o.Network.IsReordering = *reorder
+	o.Repo = *repo
 	o.Clients = simulation.Workload(s)
 	if *cmds != "" {
 		o.Clients = nil
@@ -79,7 +83,7 @@ func gen(s uint64, r sim.Rand) *sim.Plan {
 	if !*faults {
 		return &sim.Plan{}
 	}
-	return simulation.FaultPlan(simulation.Servers, sim.Time(*until), *buggify)(s, r)
+	return simulation.FaultPlan(simulation.Servers, sim.Time(*until), *buggify, *repo != simulation.RepoMemory)(s, r)
 }
 
 func planFor(s uint64) *sim.Plan {
@@ -93,16 +97,42 @@ func run(s uint64, p *sim.Plan) (*simulation.Cluster, error) {
 }
 
 func sweep() int {
+	var mu sync.Mutex
+	var failovers []sim.Duration
 	f, failed := sim.Sweep(*from, *from+*count, gen,
 		func(s uint64) (*sim.Sim, *simulation.Cluster) {
 			cl := simulation.Prepare(opts(s))
 			return cl.Sim, cl
 		},
 		func(_ *sim.Sim, cl *simulation.Cluster) error {
-			return cl.Check(sim.Time(*until))
+			err := cl.Check(sim.Time(*until))
+			if err == nil {
+				mu.Lock()
+				failovers = append(failovers, cl.Failover)
+				mu.Unlock()
+			}
+			return err
 		})
+
+	// one seed can be slow, a split vote needs another round, but the usual
+	// failover is one election timeout. Slower means elections are slow.
+	slow := false
+	if len(failovers) > 0 {
+		slices.Sort(failovers)
+		m := simulation.Median(failovers)
+		fmt.Printf("failover after crashing the leader: median %dms, p90 %dms, max %dms (%d seeds)\n",
+			m, failovers[len(failovers)*9/10], failovers[len(failovers)-1], len(failovers))
+		if m > simulation.ElectionTimeoutMax {
+			slow = true
+			fmt.Printf("SLOW: the median failover is over the %dms election timeout\n", simulation.ElectionTimeoutMax)
+		}
+	}
+
 	if f == nil {
 		fmt.Printf("clean: seeds %d..%d\n", *from, *from+*count-1)
+		if slow {
+			return 1
+		}
 		return 0
 	}
 

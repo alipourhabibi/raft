@@ -1,6 +1,7 @@
 package simulation
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
 	"github.com/alipourhabibi/raft/internal/raft"
+	"github.com/alipourhabibi/raft/internal/repository/raft/memory"
 )
 
 type Cluster struct {
@@ -23,6 +25,13 @@ type Cluster struct {
 	Commands [][]string // each client's commands
 
 	memo *memo // what the invariants saw over the whole run
+
+	// mem is set when the servers use the real memory repository instead of
+	// the sim disk, one per server, kept so the checks can read its log
+	mem map[int]*memory.MemoryDB
+
+	// Failover is how long the last CheckFailover took
+	Failover sim.Duration
 }
 
 // New builds and starts a cluster with no faults.
@@ -35,6 +44,9 @@ func New(opts ClusterOpts) *Cluster {
 // Prepare builds a cluster with its invariants but does not start it, so a
 // fault plan can go in with StartWith, or Sweep can start it.
 func Prepare(opts ClusterOpts) *Cluster {
+	if opts.Repo != RepoSim && opts.Repo != RepoMemory {
+		panic(fmt.Sprintf("harness: unknown repo %q", opts.Repo))
+	}
 	simCfg := sim.Config{
 		Seed:          opts.Seed,
 		MaxEvents:     1_000_000,
@@ -45,6 +57,9 @@ func Prepare(opts ClusterOpts) *Cluster {
 
 	cl := Build(simCfg, opts.Nodes, NodeConfigs(opts.Nodes), opts.Clients)
 	cl.Commands = opts.Clients
+	if opts.Repo == RepoMemory {
+		cl.mem = map[int]*memory.MemoryDB{}
+	}
 	cl.memo = newMemo()
 	cl.Sim.AddInvariant(cl.memo.check)
 	return cl
@@ -80,19 +95,34 @@ func Build(cfg sim.Config, ids []raft.NodeID, cfgs map[raft.NodeID]*config.Confi
 				sim:      c.Sim,
 			}
 		}
-		return &driver{
+		d := &driver{
 			turn:     &sim.Turn{},
 			cfg:      cfgs[nodesMap[id]],
 			ids:      nodesInt,
 			nodesMap: nodesMap,
 		}
+		if c.mem != nil {
+			// one memory repo per server, the same one after a restart
+			if c.mem[id] == nil {
+				c.mem[id] = memory.NewMemoryDB(d.cfg)
+			}
+			d.mem = c.mem[id]
+		}
+		return d
 	}
 
 	c.Sim = sim.New(cfg, all, factory)
 	return c
 }
 
+// Repo is which raft repository the servers use.
+const (
+	RepoSim    = ""       // the sim disk: crashes lose what was not synced
+	RepoMemory = "memory" // internal/repository/raft/memory, as main.go uses it
+)
+
 type ClusterOpts struct {
+	Repo    string
 	Seed    uint64
 	Nodes   []raft.NodeID
 	Network sim.NetworkConfig
@@ -134,7 +164,7 @@ func NodeConfigs(ids []raft.NodeID) map[raft.NodeID]*config.Config {
 			Nodes:                peers,
 			TickInterval:         10,
 			ElectionTimeoutStart: 150,
-			ElectionTimeoutEnd:   300,
+			ElectionTimeoutEnd:   ElectionTimeoutMax,
 			HeartbeatTimeout:     50,
 		}
 	}
@@ -184,7 +214,7 @@ func (c *Cluster) CheckAckedWrites(everywhere bool) error {
 		info := op.Value.(OpInfo)
 		var on []int
 		for _, id := range c.Servers {
-			for _, e := range durableLog(c.Sim, id) {
+			for _, e := range c.serverLog(id) {
 				if e.SerialNumber == info.Serial {
 					on = append(on, id)
 					break
@@ -286,6 +316,15 @@ func (c *Cluster) CheckStateMachineApplied(key, want string) error {
 
 // durableLog reads a server's log straight from its disk, so it works for a
 // crashed node too. log[0] is index 1.
+// serverLog is a server's log as its repository has it, also when it is down.
+func (c *Cluster) serverLog(id int) []*raftpb.Entry {
+	if c.mem != nil {
+		entries, _ := c.mem[id].GetEntryFromIndex(context.Background(), 0)
+		return entries
+	}
+	return durableLog(c.Sim, id)
+}
+
 func durableLog(s *sim.Sim, id int) []*raftpb.Entry {
 	b, ok := s.Get(id, keyLastIndex)
 	if !ok {
@@ -333,14 +372,19 @@ const noWipe = 1 << 62
 // FaultPlan makes the fault plan for one seed: crashes, pauses, partitions
 // and lossy links on the servers only, never more than one server down, so a
 // quorum is always possible. buggifyPercent > 0 also turns on BuggifySkipSync
-// for some seeds.
-func FaultPlan(servers []int, until sim.Time, buggifyPercent int) func(uint64, sim.Rand) *sim.Plan {
+// for some seeds. crashes=false leaves crashes out, for the memory repo: it
+// keeps nothing across a restart, like the real process, so raft can't be
+// safe with it once a node crashes.
+func FaultPlan(servers []int, until sim.Time, buggifyPercent int, crashes bool) func(uint64, sim.Rand) *sim.Plan {
 	cfg := sim.PlanConfig{
 		Until:      until,
 		MeanGap:    300,
 		MaxDown:    1,
 		Weights:    sim.DefaultWeights(),
 		WipeChance: noWipe,
+	}
+	if !crashes {
+		cfg.Weights.Crash = 0
 	}
 	if buggifyPercent > 0 {
 		cfg.Buggify = []string{BuggifySkipSync}
@@ -402,5 +446,80 @@ func (c *Cluster) Check(until sim.Time) error {
 			return fmt.Errorf("after heal: %w", err)
 		}
 	}
-	return c.CheckReads()
+	if err := c.CheckReads(); err != nil {
+		return err
+	}
+
+	// raft with 3 servers must keep going with any 2, so lose the leader
+	d, err := c.CheckFailover(5000)
+	c.Failover = d
+	return err
+}
+
+// ElectionTimeoutMax is the longest election timeout of every server. After
+// the leader dies, a follower times out within this and should win the
+// election right away, so a failover takes about this long. Much more means
+// the election itself is slow.
+const ElectionTimeoutMax = 300
+
+// CheckFailover crashes the leader for good and waits for the others to elect
+// a new one and commit an entry of its term. It returns how long that took.
+func (c *Cluster) CheckFailover(budget sim.Duration) (sim.Duration, error) {
+	leader := func(minTerm uint64, committed bool) (int, uint64, bool) {
+		for _, id := range c.Servers {
+			if !c.Sim.Up(id) {
+				continue
+			}
+			d := c.Sim.Handler(id).(*driver)
+			ctx := c.Sim.ReadCtx(id)
+			snap := d.snapshot(ctx)
+			if snap.Role != raftpb.Role_LEADER || snap.Term < minTerm {
+				continue
+			}
+			if committed {
+				// an entry of its own term is committed, so a majority
+				// really follows it
+				log := d.logEntries(ctx)
+				if snap.CommitIndex == 0 || snap.CommitIndex > uint64(len(log)) ||
+					log[snap.CommitIndex-1].Term != snap.Term {
+					continue
+				}
+			}
+			return id, snap.Term, true
+		}
+		return 0, 0, false
+	}
+
+	start := c.Sim.Now()
+	old, term, ok := leader(0, true)
+	for ; !ok && c.Sim.Now() < start+sim.Time(budget); old, term, ok = leader(0, true) {
+		if err := c.Sim.RunUntil(c.Sim.Now() + 1); err != nil {
+			return 0, err
+		}
+	}
+	if !ok {
+		return 0, fmt.Errorf("failover: no leader to crash after %dms", budget)
+	}
+
+	c.Sim.InjectFault(sim.NewCrashFault(old, false, 0)) // stays down
+	start = c.Sim.Now()
+	for c.Sim.Now() < start+sim.Time(budget) {
+		if err := c.Sim.RunUntil(c.Sim.Now() + 1); err != nil {
+			return 0, err
+		}
+		if _, _, ok := leader(term+1, true); ok {
+			return sim.Duration(c.Sim.Now() - start), nil
+		}
+	}
+	return 0, fmt.Errorf("failover: node %d was leader of term %d and crashed, "+
+		"no new leader committed anything in %dms", old, term, budget)
+}
+
+// Median of the durations, 0 for none.
+func Median(ds []sim.Duration) sim.Duration {
+	if len(ds) == 0 {
+		return 0
+	}
+	s := slices.Sorted(slices.Values(ds))
+	return s[len(s)/2]
 }

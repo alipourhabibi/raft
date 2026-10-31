@@ -10,6 +10,7 @@ import (
 	raftpb "github.com/alipourhabibi/raft/gen/go/raft/v1"
 	"github.com/alipourhabibi/raft/internal/config"
 	"github.com/alipourhabibi/raft/internal/raft"
+	raftRepo "github.com/alipourhabibi/raft/internal/repository/raft"
 	"github.com/alipourhabibi/raft/internal/statemachine"
 )
 
@@ -20,6 +21,7 @@ const BuggifySkipSync = "raft/skip-sync"
 type driver struct {
 	node *raft.Raft
 	turn *sim.Turn
+	mem  raftRepo.RaftRepository // nil: the sim disk, see ClusterOpts.Repo
 
 	// kept for OnRestart, which is where the node is built
 	cfg      *config.Config
@@ -154,8 +156,12 @@ func (d *driver) OnRestart(ctx *sim.Ctx) {
 		panic(fmt.Sprintf("harness: state machine: %v", err))
 	}
 
+	var repo raftRepo.RaftRepository = &store{d.turn}
+	if d.mem != nil {
+		repo = d.mem
+	}
 	node, err := raft.NewRaftService(
-		&store{d.turn},
+		repo,
 		d.cfg,
 		sm,
 		&transport{turn: d.turn, ids: d.ids},

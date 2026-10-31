@@ -11,11 +11,6 @@ import (
 )
 
 func NewMemoryDB(config *config.Config) *MemoryDB {
-
-	clusterConfig := &raftpb.ClusterConfig{
-		Nodes: config.Nodes,
-	}
-
 	// Sentinel entry at index 0 - the "null" log entry
 	sentinel := &raftpb.Entry{Term: 0}
 	return &MemoryDB{
@@ -23,7 +18,11 @@ func NewMemoryDB(config *config.Config) *MemoryDB {
 		votes:       map[uint64]string{},
 		logs:        []*raftpb.Entry{sentinel},
 
-		clusterConfig: clusterConfig,
+		// no cluster config until raft sets one, like redis. config.Nodes
+		// is the peers only, raft trusts a stored config, so the node was
+		// not in its own cluster: it needed every peer for a vote or a
+		// commit and stepped down after any membership change.
+		clusterConfig: nil,
 
 		serialNumbers: map[string]bool{},
 	}

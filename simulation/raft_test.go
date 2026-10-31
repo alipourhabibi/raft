@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/alipourhabibi/detsim/sim"
@@ -197,8 +198,42 @@ func TestFaultSweep(t *testing.T) {
 	}
 	// ponytail: 200 seeds keeps go test fast; a deep hunt is
 	// go run ./cmd/simulation, which sweeps 1000
-	f, _ := sim.Sweep(1, 201, FaultPlan(Servers, Until, 0), func(seed uint64) (*sim.Sim, *Cluster) {
+	var mu sync.Mutex
+	var failovers []sim.Duration
+	f, _ := sim.Sweep(1, 201, FaultPlan(Servers, Until, 0, true), func(seed uint64) (*sim.Sim, *Cluster) {
 		opts := DefaultOpts(seed)
+		opts.Clients = Workload(seed)
+		cl := Prepare(opts)
+		return cl.Sim, cl
+	}, func(_ *sim.Sim, cl *Cluster) error {
+		err := cl.Check(Until)
+		mu.Lock()
+		failovers = append(failovers, cl.Failover)
+		mu.Unlock()
+		return err
+	})
+	if f != nil {
+		dump(t, f.Ctx)
+		t.Fatalf("seed %d: %v\nplan:\n%s", f.Seed, f.Err, f.Plan)
+	}
+
+	// one seed can be slow, a split vote needs another round, but the
+	// usual failover is one election timeout
+	if m := Median(failovers); m > ElectionTimeoutMax {
+		t.Fatalf("failover takes %dms in the middle seed, more than the %dms election timeout",
+			m, ElectionTimeoutMax)
+	}
+}
+
+// the same with the memory repository main.go uses when DBType is not redis.
+// no crashes before the failover: the memory repo keeps nothing across one.
+func TestMemoryRepo(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow")
+	}
+	f, _ := sim.Sweep(1, 51, FaultPlan(Servers, Until, 0, false), func(seed uint64) (*sim.Sim, *Cluster) {
+		opts := DefaultOpts(seed)
+		opts.Repo = RepoMemory
 		opts.Clients = Workload(seed)
 		cl := Prepare(opts)
 		return cl.Sim, cl
@@ -233,7 +268,7 @@ func TestCorpus(t *testing.T) {
 			t.Parallel()
 			plan := e.Plan
 			if plan == nil {
-				plan = FaultPlan(Servers, Until, 0)(e.Seed, sim.NewStream(e.Seed, sim.StreamFault))
+				plan = FaultPlan(Servers, Until, 0, true)(e.Seed, sim.NewStream(e.Seed, sim.StreamFault))
 			}
 			opts := DefaultOpts(e.Seed)
 			opts.Clients = Workload(e.Seed)
