@@ -3,7 +3,7 @@ module github.com/alipourhabibi/raft
 go 1.26.6
 
 require (
-	github.com/alipourhabibi/detsim v0.0.0-20261027130016-08aa84dc9002
+	github.com/alipourhabibi/detsim v0.0.0-20261031114439-638fcfd21e0f
 	github.com/caarlos0/env/v11 v11.4.0
 	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.7.1
